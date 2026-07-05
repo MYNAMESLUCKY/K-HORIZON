@@ -1,0 +1,19 @@
+# Local configurations & credentials
+.vscode/
+.env
+.env.*
+
+# Extension state & local agent cache
+.k-horizon/
+scratch/
+*.log
+
+# Dependencies
+node_modules/
+
+# Compilation outputs
+dist/
+out/
+
+# Extension packages
+*.vsix

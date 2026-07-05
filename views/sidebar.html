@@ -1,0 +1,365 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src ##CSP_SOURCE## https: data:; script-src ##CSP_SOURCE## 'unsafe-inline' https:; style-src ##CSP_SOURCE## 'unsafe-inline' https:; font-src ##CSP_SOURCE## https:;">
+  <link rel="stylesheet" href="##SHARED_CSS_URI##">
+  <title>K-Horizon Chat</title>
+</head>
+<body>
+  <!-- History Drawer -->
+  <div class="history-drawer" id="historyDrawer">
+    <div class="drawer-body">
+      <div class="history-header">
+        <span>Chat History</span>
+        <button class="icon-btn" id="closeDrawerBtn" title="Close Drawer" aria-label="Close Drawer">x</button>
+      </div>
+      <div class="history-list" id="historyList"></div>
+    </div>
+    <div class="drawer-resizer" id="drawerResizer"></div>
+  </div>
+
+  <div class="panel">
+    <div class="header-bar">
+      <div class="header-main-row">
+        <span class="header-title">K-HORIZON</span>
+        <div class="header-actions" style="display: flex; align-items: center; gap: 4px; flex-wrap: wrap;">
+          <select id="roleSelector" class="model-select-dropdown role-select" title="Select Agent Role" style="margin: 0; width: 85px; font-size: 10px; height: 22px; padding: 2px;">
+            <option value="developer">Developer</option>
+            <option value="planner">Planner</option>
+            <option value="security">Security</option>
+            <option value="tester">Tester</option>
+            <option value="refactorer">Refactor</option>
+          </select>
+          <button class="icon-btn" id="compactBtn" title="Compact Context (Save Tokens)" aria-label="Compact Context">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="4 14 10 14 10 20"></polyline>
+              <polyline points="20 10 14 10 14 4"></polyline>
+              <line x1="14" y1="10" x2="21" y2="3"></line>
+              <line x1="10" y1="14" x2="3" y2="21"></line>
+            </svg>
+          </button>
+          <button class="icon-btn" id="rollbackBtn" title="Undo Last Turn" aria-label="Undo Last Turn" style="display: none;">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M3 7v6h6"></path>
+              <path d="M21 17a9 9 0 0 0-9-9 9 9 0 0 0-6 2.3L3 13"></path>
+            </svg>
+          </button>
+          <button class="icon-btn" id="healthBtn" title="Workspace Health" aria-label="Workspace Health">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M22 12h-4l-3 8-6-16-3 8H2"></path>
+            </svg>
+          </button>
+          <button class="icon-btn" id="manageProfilesBtn" title="Manage Profiles" aria-label="Manage Profiles">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="3"></circle>
+              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+            </svg>
+          </button>
+          <button class="icon-btn mcp-status-button" id="mcpSettingsBtn" title="MCP Servers" aria-label="MCP Servers">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+              <rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect>
+              <rect x="6" y="14" width="12" height="8" rx="2" ry="2"></rect>
+              <line x1="6" y1="10" x2="6" y2="14"></line>
+              <line x1="18" y1="10" x2="18" y2="14"></line>
+            </svg>
+            <span id="mcpActiveIndicator" class="mcp-active-indicator" title="MCP Server Connection Status"></span>
+          </button>
+          <button class="icon-btn" id="promptLibraryBtn" title="Prompt Library" aria-label="Prompt Library">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"></path>
+              <path d="M4 4.5A2.5 2.5 0 0 1 6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5z"></path>
+            </svg>
+          </button>
+          <button class="icon-btn" id="historyBtn" title="Chat History" aria-label="Chat History">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"></circle>
+              <polyline points="12 6 12 12 16 14"></polyline>
+            </svg>
+          </button>
+          <button class="icon-btn" id="newChatBtn" title="New Chat Session" aria-label="New Chat Session">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="12" y1="5" x2="12" y2="19"></line>
+              <line x1="5" y1="12" x2="19" y2="12"></line>
+            </svg>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Compacting Alert Banner -->
+    <div class="system-banner" id="compactBanner" style="display:none;">
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;">
+        <circle cx="12" cy="12" r="10"></circle>
+        <line x1="12" y1="8" x2="12" y2="12"></line>
+        <line x1="12" y1="16" x2="12.01" y2="16"></line>
+      </svg>
+      <span>Conversation compacted to save tokens.</span>
+    </div>
+
+    <!-- Tab Bar -->
+    <div class="sidebar-tabs">
+      <button id="tabChatBtn" class="tab-btn active">Chat</button>
+      <button id="tabArtifactsBtn" class="tab-btn tab-btn-with-badge">
+        <span>Artifacts</span>
+        <span id="artifactsCountBadge" class="artifacts-count-badge">0</span>
+      </button>
+    </div>
+
+    <!-- Chat Tab Content -->
+    <div id="chatTabContent" class="chat-tab-content">
+      <div class="messages-container" id="messages">
+        <div class="message assistant" id="welcomeMessage">
+          <span>Hi! I'm <strong>K-HORIZON AI</strong>. How can I help you program today?</span>
+          <div class="welcome-dashboard">
+            <span class="welcome-title">Suggested Prompts</span>
+            <div class="welcome-grid">
+              <button class="welcome-card" onclick="submitQuickAction('/explain')">
+                <span class="welcome-card-cmd">/explain</span>
+                <span class="welcome-card-desc">Explain how the active code works</span>
+              </button>
+              <button class="welcome-card" onclick="submitQuickAction('/tests')">
+                <span class="welcome-card-cmd">/tests</span>
+                <span class="welcome-card-desc">Generate unit tests for active file</span>
+              </button>
+              <button class="welcome-card" onclick="submitQuickAction('/fix')">
+                <span class="welcome-card-cmd">/fix</span>
+                <span class="welcome-card-desc">Identify and fix bugs or linter issues</span>
+              </button>
+              <button class="welcome-card" onclick="submitQuickAction('/refactor')">
+                <span class="welcome-card-cmd">/refactor</span>
+                <span class="welcome-card-desc">Suggest cleanliness and performance refactoring</span>
+              </button>
+              <button class="welcome-card" onclick="submitQuickAction('/document')">
+                <span class="welcome-card-cmd">/document</span>
+                <span class="welcome-card-desc">Add documentation comments and docstrings</span>
+              </button>
+            </div>
+          </div>
+          <span class="welcome-hint">Use <code>@filename</code> to reference specific files in the workspace with minimal token usage.</span>
+        </div>
+      </div>
+    </div>
+
+    <!-- Artifacts Tab Content -->
+    <div id="artifactsTabContent" class="artifacts-tab-content">
+      <div id="artifactsEmptyState" class="artifacts-empty-state">
+        No artifacts generated in this session yet.
+      </div>
+      <div id="artifactsList" class="artifacts-list"></div>
+    </div>
+
+    <!-- Collapsible: Token Budget -->
+    <details class="collapsible-section token-hud-section" id="tokenHudSection">
+      <summary>
+        <span class="section-label">Token Budget</span>
+        <span class="section-value" id="hudTokenSummary">0%</span>
+      </summary>
+      <div class="section-body" style="width: 100%; display: flex; flex-direction: column; gap: 4px; box-sizing: border-box;">
+        <div class="context-hud" id="contextHud" style="margin: 0; padding: 0; width: 100%;">
+          <div class="context-hud-label" style="display: flex; justify-content: space-between; font-size: 10px; margin-bottom: 2px;">
+            <span id="hudTokenLabel">0 / 32,000 estimated tokens</span>
+          </div>
+          <div class="hud-bar-bg" style="height: 4px; background: rgba(255, 255, 255, 0.1); border-radius: 2px; overflow: hidden; width: 100%;">
+            <div class="hud-bar-fill" id="hudTokenFill" style="width: 0%; height: 100%; background: var(--button-bg, #007acc); transition: width 0.3s ease;"></div>
+          </div>
+        </div>
+      </div>
+    </details>
+
+    <!-- Dropdown Suggestion List for @ mentions -->
+    <div class="suggest-list" id="suggestList"></div>
+
+    <div class="input-wrapper">
+      <div class="pinned-container" id="pinnedContainer">
+        <span class="pinned-label">Pinned</span>
+        <div id="pinnedList" class="pinned-list"></div>
+      </div>
+      <div class="tags-container" id="tagsContainer"></div>
+      
+      <textarea 
+        class="chat-input" 
+        id="chatInput" 
+        placeholder="Message K-Horizon..."
+      ></textarea>
+      
+      <div class="input-actions">
+        <div class="input-stack">
+          <div class="chat-toolbar">
+            <div class="chat-toolbar-left" style="display: flex; gap: 4px; align-items: center; min-width: 0; flex: 1;">
+              <button class="icon-btn" id="attachFileBtn" title="Attach Files (Open Picker)" aria-label="Attach Files" style="flex-shrink: 0;">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                  <line x1="12" y1="5" x2="12" y2="19"></line>
+                  <line x1="5" y1="12" x2="19" y2="12"></line>
+                </svg>
+              </button>
+              <div class="model-selectors-wrapper" style="display: flex; gap: 4px; align-items: center; min-width: 0; flex: 1;">
+                <select id="modelSelector" class="model-select-dropdown" title="Select AI Model" style="margin: 0; flex: 1; max-width: 150px; min-width: 70px;"></select>
+                <select id="modelSelector2" class="model-select-dropdown" title="Select Model 2" style="display: none; margin: 0; flex: 1; max-width: 150px; min-width: 70px;"></select>
+              </div>
+              <button class="icon-btn" id="splitBtn" title="Split Screen (Compare Models)" aria-label="Split Screen" style="flex-shrink: 0;">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+                  <line x1="12" y1="3" x2="12" y2="21"></line>
+                </svg>
+              </button>
+            </div>
+            <div class="chat-toolbar-right">
+              <button class="action-btn improve-btn" id="improvePromptBtn" title="Improve Prompt (AI)">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="m15 4-2 2L5 14l-2 2v3h3l2-2 8-8-2-2zM19 11l2-2M20.5 4.5l-1-1M19 3l-2 2M14 2l1 1"></path>
+                </svg>
+                <span>Improve</span>
+              </button>
+              <button class="action-btn danger-btn" id="cancelBtn" style="display: none;">
+                <span>Stop</span>
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <rect x="4" y="4" width="16" height="16" rx="2" ry="2"></rect>
+                </svg>
+              </button>
+              <button class="action-btn" id="sendBtn">
+                <span>Send</span>
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <line x1="22" y1="2" x2="11" y2="13"></line>
+                  <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                </svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Workspace Health Modal -->
+  <div class="modal" id="healthModal" style="display: none;">
+    <div class="modal-content feature-modal-content">
+      <div class="modal-header">
+        <h3>Workspace Health</h3>
+        <button class="icon-btn" id="closeHealthModalBtn" title="Close" aria-label="Close">x</button>
+      </div>
+      <div class="health-grid" id="healthGrid"></div>
+    </div>
+  </div>
+
+  <!-- Prompt Library Modal -->
+  <div class="modal" id="promptLibraryModal" style="display: none;">
+    <div class="modal-content feature-modal-content">
+      <div class="modal-header">
+        <h3>Prompt Library</h3>
+        <button class="icon-btn" id="closePromptLibraryBtn" title="Close" aria-label="Close">x</button>
+      </div>
+      <div class="prompt-library-layout">
+        <div class="prompt-template-list" id="promptTemplateList"></div>
+        <div class="prompt-save-panel">
+          <input id="promptTemplateName" type="text" placeholder="Template name">
+          <textarea id="promptTemplateBody" rows="5" placeholder="Prompt text"></textarea>
+          <button class="action-btn" id="savePromptTemplateBtn" type="button">Save Prompt</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Agent Profiles Modal -->
+  <div class="modal" id="profilesModal" style="display: none;">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>Manage Agent Profiles</h3>
+        <button class="icon-btn" id="closeModalBtn" title="Close" aria-label="Close">x</button>
+      </div>
+      <div class="modal-body">
+        <div class="profile-list-section form-section">
+          <h4 class="modal-section-title">Custom Roles</h4>
+          <div id="modalProfilesList" class="modal-list"></div>
+          <button class="action-btn" id="addNewProfileBtn">Add New Role</button>
+        </div>
+        <div class="profile-form-section form-section bordered" id="profileForm" style="display: none;">
+          <h4 id="formTitle" class="modal-section-title">Edit Role</h4>
+          <input type="hidden" id="editProfileIndex">
+          <div class="form-group">
+            <label for="profileKey">Role Key</label>
+            <input type="text" id="profileKey" placeholder="security">
+          </div>
+          <div class="form-group">
+            <label for="profileName">Display Name</label>
+            <input type="text" id="profileName">
+          </div>
+          <div class="form-group">
+            <label for="profilePrompt">System Instructions</label>
+            <textarea id="profilePrompt" rows="4"></textarea>
+          </div>
+          <div class="form-group">
+            <label for="profileModel">Override Model</label>
+            <select id="profileModel"></select>
+          </div>
+          <div class="form-group">
+            <label for="profileTemp">Temperature</label>
+            <input type="number" id="profileTemp" min="0" max="2" step="0.1" placeholder="e.g. 0.2">
+          </div>
+          <div class="modal-actions">
+            <button class="action-btn" id="saveProfileBtn">Save</button>
+            <button class="action-btn danger-btn" id="deleteProfileBtn">Delete</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- MCP Servers Modal -->
+  <div class="modal" id="mcpModal" style="display: none;">
+    <div class="modal-content mcp-modal-content">
+      <div class="modal-header">
+        <div class="modal-title-row">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="2" y="2" width="20" height="8" rx="2" ry="2"></rect>
+            <rect x="6" y="14" width="12" height="8" rx="2" ry="2"></rect>
+            <line x1="6" y1="10" x2="6" y2="14"></line>
+            <line x1="18" y1="10" x2="18" y2="14"></line>
+          </svg>
+          <span class="modal-heading">MCP Servers Manager</span>
+        </div>
+        <button class="icon-btn" id="closeMcpModalBtn" title="Close" aria-label="Close">x</button>
+      </div>
+      <div class="modal-body">
+        <div class="mcp-list-section form-section">
+          <h4 class="modal-section-title">Active Connections</h4>
+          <div id="mcpServersList" class="mcp-servers-list-container"></div>
+        </div>
+        <div class="mcp-form-section">
+          <h4 class="modal-section-title">Connect New Server (stdio)</h4>
+          <div class="mcp-form-group">
+            <label for="mcpPreset">Or load a preset...</label>
+            <select id="mcpPreset" style="background: var(--vscode-input-background, #1e1e1e); color: var(--vscode-input-foreground, #ffffff); border: 1px solid var(--vscode-input-border, var(--border-light)); padding: 6px 8px; font-size: 11px; border-radius: 4px; outline: none; margin-bottom: 8px;">
+              <option value="">-- Choose a Preset --</option>
+              <option value="stitch">Google Labs Stitch (Design System & UI)</option>
+              <option value="playwright">Playwright Browser Automation (Testing & Inspecting)</option>
+              <option value="github">GitHub Server (Issue & PR Management)</option>
+              <option value="postgres">PostgreSQL Server (Query & Schema Inspection)</option>
+              <option value="filesystem">Filesystem Server (Secure Path Access)</option>
+            </select>
+          </div>
+          <div class="mcp-form-group">
+            <label for="mcpName">Server ID / Name</label>
+            <input type="text" id="mcpName" placeholder="e.g. git-server">
+          </div>
+          <div class="mcp-form-group">
+            <label for="mcpCommand">Runtime / Command Path</label>
+            <input type="text" id="mcpCommand" placeholder="e.g. npx, node, python">
+          </div>
+          <div class="mcp-form-group">
+            <label for="mcpArgs">Startup Arguments (JSON Array)</label>
+            <input type="text" id="mcpArgs" placeholder='e.g. ["-y", "@modelcontextprotocol/server-git"]'>
+          </div>
+          <div class="mcp-form-group">
+            <label for="mcpEnv">Environment Variables (JSON Object - Optional)</label>
+            <input type="text" id="mcpEnv" placeholder='e.g. {"STITCH_API_KEY": "AIzaSy..."}'>
+          </div>
+          <button class="action-btn" id="saveMcpBtn">Establish Connection</button>
+        </div>
+      </div>
+    </div>
+
+  <script src="##SIDEBAR_JS_URI##"></script>
+</body>
+</html>

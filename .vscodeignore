@@ -1,0 +1,32 @@
+# Exclude everything that is not required at runtime from the packaged VSIX.
+# The webpack bundle (dist/extension.js) already contains every runtime
+# dependency, so we can safely ignore the rest of node_modules.
+
+.vscode/**
+.vscode-test/**
+out/**
+src/**
+tsconfig.json
+webpack.config.js
+ts-loader.js
+scratch/**
+
+# Tooling and dev files
+.gitignore
+.git/**
+.github/**
+.eslintrc*
+.prettierrc*
+*.tsbuildinfo
+*.log
+.DS_Store
+Thumbs.db
+
+# Test/build artifacts
+coverage/**
+test/**
+tests/**
+__tests__/**
+
+# Don't ship local agent run logs and metadata
+.k-horizon/**

@@ -1,0 +1,320 @@
+{
+  "name": "k-horizon",
+  "displayName": "K-HORIZON",
+  "description": "Token-efficient, customizable AI coding assistant with inline edits, sidebar chat, composer, and autocomplete.",
+  "version": "1.0.1",
+  "publisher": "k-horizon",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": [
+    "AI",
+    "Programming Languages"
+  ],
+  "keywords": [
+    "ai",
+    "copilot",
+    "chatbot",
+    "autocomplete",
+    "inline-edit",
+    "composer",
+    "agent",
+    "mcp",
+    "rag"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/k-horizon/k-horizon.git"
+  },
+  "bugs": {
+    "url": "https://github.com/k-horizon/k-horizon/issues"
+  },
+  "homepage": "https://github.com/k-horizon/k-horizon#readme",
+  "license": "MIT",
+  "main": "./dist/extension.js",
+  "activationEvents": [],
+  "contributes": {
+    "commands": [
+      {
+        "command": "k-horizon.inline-edit",
+        "title": "K-Horizon: Inline Edit/Generate Code"
+      },
+      {
+        "command": "k-horizon.composer",
+        "title": "K-Horizon: Open Workspace Composer"
+      },
+      {
+        "command": "k-horizon.toggle-autocomplete",
+        "title": "K-Horizon: Toggle Autocomplete"
+      },
+      {
+        "command": "k-horizon.chat-clear",
+        "title": "K-Horizon: Clear Chat History"
+      },
+      {
+        "command": "k-horizon.set-supabase-connection",
+        "title": "K-Horizon: Set Supabase Connection String"
+      },
+      {
+        "command": "k-horizon.inline-edit-accept",
+        "title": "K-Horizon: Accept Inline Edit"
+      },
+      {
+        "command": "k-horizon.inline-edit-reject",
+        "title": "K-Horizon: Reject/Undo Inline Edit"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "k-horizon.inline-edit",
+        "key": "ctrl+shift+k",
+        "mac": "cmd+shift+k",
+        "when": "editorTextFocus"
+      },
+      {
+        "command": "k-horizon.composer",
+        "key": "ctrl+shift+i",
+        "mac": "cmd+shift+i"
+      },
+      {
+        "command": "workbench.view.extension.k-horizon-container",
+        "key": "ctrl+shift+l",
+        "mac": "cmd+shift+l"
+      },
+      {
+        "command": "k-horizon.inline-edit-accept",
+        "key": "enter",
+        "when": "editorTextFocus && k-horizon.inInlineEditMode"
+      },
+      {
+        "command": "k-horizon.inline-edit-reject",
+        "key": "escape",
+        "when": "editorTextFocus && k-horizon.inInlineEditMode"
+      }
+    ],
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "k-horizon-container",
+          "title": "K-HORIZON AI",
+          "icon": "$(rocket)"
+        }
+      ]
+    },
+    "views": {
+      "k-horizon-container": [
+        {
+          "icon": "",
+          "type": "webview",
+          "id": "k-horizon-chat-view",
+          "name": "K-Horizon Chat"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "K-HORIZON Configuration",
+      "properties": {
+        "k-horizon.provider": {
+          "type": "string",
+          "default": "Gemini",
+          "enum": [
+            "Gemini",
+            "Ollama",
+            "OpenAI",
+            "Anthropic",
+            "OpenRouter",
+            "Custom",
+            "Copilot"
+          ],
+          "description": "AI model provider to use."
+        },
+        "k-horizon.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key for your selected provider (leave blank for Ollama)."
+        },
+        "k-horizon.stitchApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Optional API Key for Google Labs Stitch integration."
+        },
+        "k-horizon.baseURL": {
+          "type": "string",
+          "default": "",
+          "description": "Custom API endpoint URL. If empty, uses standard defaults (e.g. localhost:11434 for Ollama)."
+        },
+        "k-horizon.chatModel": {
+          "type": "string",
+          "default": "gemini-1.5-flash",
+          "description": "Model ID to use for Chat, Composer, and Inline Edits (e.g., gemini-1.5-flash, claude-3-5-sonnet, gpt-4o, codegemma)."
+        },
+        "k-horizon.plannerModel": {
+          "type": "string",
+          "default": "gemini-1.5-flash",
+          "description": "Model ID to use for planning, routing, and tool choices in the agent loop."
+        },
+        "k-horizon.coderModel": {
+          "type": "string",
+          "default": "gemini-1.5-flash",
+          "description": "Model ID to use for code generation, edit_file, and write_file tasks."
+        },
+        "k-horizon.autocompleteModel": {
+          "type": "string",
+          "default": "gemini-1.5-flash",
+          "description": "Lightweight model ID for code completion suggestions."
+        },
+        "k-horizon.visionModel": {
+          "type": "string",
+          "default": "gemini-1.5-flash",
+          "description": "Model ID to use for vision-based page analysis and automation tasks."
+        },
+        "k-horizon.enableAutocomplete": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable ghost-text inline code completions as you type."
+        },
+        "k-horizon.enableContinuousLearning": {
+          "type": "boolean",
+          "default": true,
+          "description": "Enable continuous agent learning and self-improvement by reflecting on mistakes in the background."
+        },
+        "k-horizon.maxContextTokens": {
+          "type": "integer",
+          "default": 131000,
+          "description": "Maximum number of code tokens to include in prompt context."
+        },
+        "k-horizon.systemPrompt": {
+          "type": "string",
+          "default": "",
+          "description": "Override the default system prompt for customization."
+        },
+        "k-horizon.supabaseConnectionString": {
+          "type": "string",
+          "default": "",
+          "description": "PostgreSQL connection string for Supabase database. Prefer using SecretStorage (DBClient.storeConnectionString) instead of settings.json to keep credentials out of source-control."
+        },
+        "k-horizon.sandboxMode": {
+          "type": "string",
+          "default": "None",
+          "enum": [
+            "None",
+            "Docker"
+          ],
+          "description": "Run terminal commands inside an ephemeral Docker container for security."
+        },
+        "k-horizon.firecrawlApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API Key for Firecrawl search and scrape service. If set, searches and scrapings will be routed via Firecrawl."
+        },
+        "k-horizon.firecrawlBaseUrl": {
+          "type": "string",
+          "default": "https://api.firecrawl.dev",
+          "description": "Base URL of the Firecrawl API."
+        },
+        "k-horizon.aicreditsApiKey": {
+          "type": "string",
+          "default": "",
+          "description": "API key for aicredits.in to query the baai/bge-en-icl embedding model."
+        },
+        "k-horizon.useWorkspaceContext": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically retrieve and inject relevant workspace codebase context for queries."
+        },
+        "k-horizon.autoApprove": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically approve high-confidence agent actions without prompting."
+        },
+        "k-horizon.autoCompile": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically run compilation after edits to check for build errors."
+        },
+        "k-horizon.autoTest": {
+          "type": "boolean",
+          "default": false,
+          "description": "Automatically run unit tests after edits to verify correctness."
+        },
+        "k-horizon.stepDebug": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable step-by-step interactive debugging mode for tool execution."
+        },
+        "k-horizon.enablePreemptiveDryRuns": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable speculative dry run compilation of workspace files on every edit or write to prevent breaking changes."
+        },
+        "k-horizon.customModels": {
+          "type": "array",
+          "default": [],
+          "description": "Custom models with their own custom API URLs.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "description": "Display name of the custom model (e.g., 'My Ollama Llama3')."
+              },
+              "modelId": {
+                "type": "string",
+                "description": "Model ID to send in requests (e.g., 'llama3')."
+              },
+              "baseURL": {
+                "type": "string",
+                "description": "Base URL of the API (e.g., 'http://localhost:11434')."
+              },
+              "apiKey": {
+                "type": "string",
+                "description": "Optional API Key."
+              },
+              "provider": {
+                "type": "string",
+                "enum": [
+                  "OpenAI",
+                  "Ollama",
+                  "Anthropic",
+                  "Gemini"
+                ],
+                "default": "OpenAI",
+                "description": "Which API protocol/format to use (OpenAI is default/standard)."
+              }
+            },
+            "required": [
+              "name",
+              "modelId",
+              "baseURL"
+            ]
+          }
+        }
+      }
+    }
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "webpack --mode production",
+    "test": "vitest run && npm run compile",
+    "test:unit": "vitest run",
+    "watch": "webpack --mode development --watch",
+    "build": "webpack --mode production"
+  },
+  "devDependencies": {
+    "@types/node": "^20.12.0",
+    "@types/pg": "^8.20.0",
+    "@types/vscode": "^1.85.0",
+    "ts-loader": "^9.5.1",
+    "vitest": "^1.6.0",
+    "webpack": "^5.91.0",
+    "webpack-cli": "^5.1.4"
+  },
+  "dependencies": {
+    "@langchain/core": "^0.3.0",
+    "@langchain/langgraph": "^0.2.0",
+    "cheerio": "^1.0.0-rc.12",
+    "pg": "^8.11.5",
+    "playwright-core": "^1.44.0",
+    "typescript": "^5.4.5"
+  }
+}
