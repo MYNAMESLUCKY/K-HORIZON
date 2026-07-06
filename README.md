@@ -42,3 +42,25 @@ Configure the extension by opening VS Code Settings (`Ctrl+,` or `Cmd+,`) and se
 ## License
 
 This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
+
+## Recent progress
+
+- Phase 2 (Better codebase awareness) implemented: impact analysis (dependency graph), targeted verification after edits, and multi-file speculative patch safety with validation and rollback.
+- Phase 3 (Agent quality and reliability) initial work completed: added a non-security general review pass, improved long-term learning integration (persisted rules in `.k-horizon/agent-learning.json` and injected into planner prompts), and richer debugging diagnostics to aid reproduce→isolate→confirm workflows.
+
+## Build & Test
+
+Run the compile and unit tests locally:
+
+```bash
+npm run compile
+npm run test:unit
+```
+
+If you want to package the extension (locally):
+
+```bash
+npx -y @vscode/vsce package
+```
+
+Contributions welcome — please open a PR with tests for non-trivial changes.
