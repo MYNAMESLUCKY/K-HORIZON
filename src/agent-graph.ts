@@ -7,6 +7,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { getWorkspaceRoot } from './workspace-utils';
 import { AgentTrace } from './agent-trace';
+import { AgentLearningManager } from './learning-manager';
 import { SUBAGENTS, isToolAllowedForSubagent, type SubagentId } from './subagents/registry';
 import * as vscode from 'vscode';
 
@@ -1566,6 +1567,12 @@ export function routeAfterCompile(state: AgentStateType): string {
   return routeToFinalizeOrAudit(state);
 }
 
+export function routeAfterTest(state: AgentStateType): string {
+  if (!state.isRunning) return 'finalize';
+  if (!state.testCompleted) return 'callLLM';
+  return routeToFinalizeOrAudit(state);
+}
+
 export function routeAfterAudit(state: AgentStateType): string {
   if (!state.isRunning) return 'finalize';
   if (!state.auditCompleted) return 'callLLM';
@@ -1771,6 +1778,7 @@ export function createAgentGraph() {
     .addConditionalEdges('runTest', routeAfterTest, {
       callLLM: 'callLLM',
       runSecurityAudit: 'runSecurityAudit',
+      runGeneralReview: 'runGeneralReview',
       finalize: 'finalize',
     })
 
