@@ -8,6 +8,7 @@ import { RAGService } from './rag-service';
 import { MCPManager } from './mcp-manager';
 import * as fs from 'fs';
 import * as path from 'path';
+import { getWorkspaceRoot } from './workspace-utils';
 
 let statusBarItem: vscode.StatusBarItem;
 
@@ -205,7 +206,7 @@ export async function activate(context: vscode.ExtensionContext) {
  * provider can inject them into the system prompt without re-reading disk.
  */
 function loadRepoInstructions(context: vscode.ExtensionContext) {
-  const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+  const workspaceRoot = getWorkspaceRoot();
   if (!workspaceRoot) return;
 
   const paths = [

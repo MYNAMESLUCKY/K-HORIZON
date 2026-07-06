@@ -1,11 +1,13 @@
 import { StateGraph, Annotation, START, END, MemorySaver } from '@langchain/langgraph';
 import { AIService } from './ai-service';
 import { ToolManager } from './tool-manager';
+import { detectVerificationCommands } from './verification-commands';
 import { ChatMessage } from './types';
 import * as fs from 'fs';
 import * as path from 'path';
+import { getWorkspaceRoot } from './workspace-utils';
 import { AgentTrace } from './agent-trace';
-import { SUBAGENTS } from './subagents/registry';
+import { SUBAGENTS, isToolAllowedForSubagent, type SubagentId } from './subagents/registry';
 import * as vscode from 'vscode';
 
 // ─────────────────────────────────────────────────────────────
@@ -208,6 +210,12 @@ export const AgentState = Annotation.Root({
     default: () => [],
   }),
 
+  /** Markdown summary of the current implementation plan, when generated. */
+  implementationPlanSummary: Annotation<string>({
+    reducer: (_, v) => v,
+    default: () => '',
+  }),
+
 /** Flag set after compile has been run. */
    compileCompleted: Annotation<boolean>({
       reducer: (_, v) => v,
@@ -273,6 +281,24 @@ export const AgentState = Annotation.Root({
       reducer: (_, v) => v,
       default: () => false,
     }),
+
+    /** Number of general review iterations performed (budget of 2). */
+    reviewAttempt: Annotation<number>({
+      reducer: (_, v) => v,
+      default: () => 0,
+    }),
+
+    /** Maximum allowed general reviews. */
+    maxReviews: Annotation<number>({
+      reducer: (_, v) => v,
+      default: () => 2,
+    }),
+
+    /** Whether general review completed successfully. */
+    reviewCompleted: Annotation<boolean>({
+      reducer: (_, v) => v,
+      default: () => false,
+    }),
 });
 
 // Type alias for convenience
@@ -317,9 +343,12 @@ async function callLLM(state: AgentStateType): Promise<Partial<AgentStateType>> 
 
   try {
     const settings = AIService.getSettings();
-    const plannerModel = settings.plannerModel || settings.chatModel;
+    const coderModel = settings.coderModel || settings.chatModel;
 
     let dynamicSystemInstruction = state.systemInstruction;
+    if (state.implementationPlanSummary) {
+      dynamicSystemInstruction += `\n\n## Current Implementation Plan\n${state.implementationPlanSummary}`;
+    }
     const currentSub = SUBAGENTS.find(s => s.id === state.currentSubagentId);
     if (currentSub) {
       dynamicSystemInstruction += `\n\n## Active Subagent Mode: ${currentSub.label}\n${currentSub.systemPrompt}`;
@@ -333,7 +362,7 @@ async function callLLM(state: AgentStateType): Promise<Partial<AgentStateType>> 
           state.onToken?.(token);
         }
       },
-      state.modelConfig?.modelId || plannerModel || undefined,
+      state.modelConfig?.modelId || coderModel || undefined,
       state.modelConfig?.provider || undefined,
       state.modelConfig?.temperature,
       undefined,
@@ -470,6 +499,69 @@ async function executeTools(state: AgentStateType): Promise<Partial<AgentStateTy
   let madeCodeChange = false;
   let nextSubagentId = state.currentSubagentId;
 
+  // Multi-file safety: if there are multiple edit-like calls, attempt a speculative
+  // workspace patch to validate the whole patch set before applying them to main branch.
+  try {
+    const fileModCalls = (state.pendingToolCalls || []).filter(c => ['edit_file', 'patch_file_lines'].includes(c.name));
+    if (fileModCalls.length > 1) {
+      const patches = [] as Array<{ file_path: string; target_content: string; replacement_content: string }>;
+      for (const c of fileModCalls) {
+        if (c.name === 'edit_file') {
+          patches.push({ file_path: c.arguments.file_path, target_content: c.arguments.target_content, replacement_content: c.arguments.replacement_content });
+        } else if (c.name === 'patch_file_lines') {
+          // Convert patch_file_lines to a whole-file replacement for speculative run
+          const fp = c.arguments.file_path;
+          const start = parseInt(String(c.arguments.start_line || '1'), 10);
+          const end = parseInt(String(c.arguments.end_line || '1'), 10);
+          try {
+            const abs = ToolManager.getAbsolutePath(fp);
+            const content = (await ToolManager.execute('read_file', { file_path: fp })) as string;
+            const lines = content.split(/\r?\n/);
+            const originalSegment = lines.slice(start - 1, end).join('\n');
+            const replacement = String(c.arguments.replacement_content || '');
+            const newWhole = [...lines.slice(0, start - 1), replacement, ...lines.slice(end)].join('\n');
+            patches.push({ file_path: fp, target_content: originalSegment, replacement_content: replacement });
+          } catch (e) {
+            // If reading fails, abort speculative path detection
+            patches.length = 0;
+            break;
+          }
+        }
+      }
+
+      if (patches.length > 0) {
+        const workspaceRoot = state.workspaceRoot || getWorkspaceRoot();
+        const cmds = workspaceRoot ? detectVerificationCommands(workspaceRoot) : { compileCommand: 'npm run compile', testCommand: null };
+        const specRes = await ToolManager.execute('run_speculative_workspace_patch', { patches_json: JSON.stringify(patches), validation_command: cmds.compileCommand });
+        if (typeof specRes === 'string' && specRes.startsWith('Success:')) {
+          madeCodeChange = true;
+          toolResultsCombined += `<tool_result name="run_speculative_workspace_patch">\n${specRes}\n</tool_result>\n`;
+          // Short-circuit: we've merged the speculative branch into main; skip individual executions
+          const toolResultMessage: ChatMessage = {
+            role: 'user',
+            content: toolResultsCombined,
+            timestamp: Date.now(),
+          };
+          return {
+            chatHistory: [toolResultMessage],
+            pendingToolCalls: [],
+            awaitingSelfHealResponse: false,
+            codeChangesMade: madeCodeChange,
+            currentSubagentId: nextSubagentId,
+            gitRollbackSafe,
+            gitSavepointChecked,
+          };
+        } else {
+          // Speculative validation failed — append message so model can see output and decide next steps.
+          toolResultsCombined += `<tool_result name="run_speculative_workspace_patch">\n${specRes}\n</tool_result>\n`;
+          // Continue to individual handling so the agent can attempt smaller fixes.
+        }
+      }
+    }
+  } catch (e) {
+    // Non-fatal: continue with individual tool execution
+  }
+
   for (const call of state.pendingToolCalls) {
     if (!state.isRunning || state.checkCancellation?.()) break;
 
@@ -561,24 +653,42 @@ async function executeTools(state: AgentStateType): Promise<Partial<AgentStateTy
     }
 
     if (proceed) {
+      // Before executing any code-changing tools, keep an up-to-date dependency
+      // graph so impact analysis can be used by the planner/coder. This helps
+      // surface downstream files that may be affected by edits.
+      try {
+        const workspaceRoot = state.workspaceRoot || getWorkspaceRoot();
+        if (workspaceRoot) {
+          await ToolManager.execute('update_dependency_graph', {});
+        }
+      } catch (e) {
+        // Non-fatal: proceed even if dependency graph update fails
+      }
       let finalArgs = { ...toolArgs };
+      const toolAllowed = call.name === 'switch_subagent' || isToolAllowedForSubagent(state.currentSubagentId as SubagentId, call.name);
 
-      AgentTrace.append({
-        runId: state.runId || 'unknown',
-        sessionId: state.sessionId,
-        type: 'tool_start',
-        timestamp: Date.now(),
-        data: { name: call.name, arguments: finalArgs },
-      });
+      if (!toolAllowed) {
+        result = `Error: Tool "${call.name}" is not allowed for subagent "${state.currentSubagentId}".`;
+        proceed = false;
+      }
 
-      if (call.name === 'switch_subagent') {
+      if (proceed && call.name === 'switch_subagent') {
         const targetId = finalArgs.subagent_id;
         if (SUBAGENTS.some(s => s.id === targetId)) {
           nextSubagentId = targetId;
         }
       }
 
-      result = await ToolManager.execute(call.name, finalArgs);
+      if (proceed) {
+        AgentTrace.append({
+          runId: state.runId || 'unknown',
+          sessionId: state.sessionId,
+          type: 'tool_start',
+          timestamp: Date.now(),
+          data: { name: call.name, arguments: finalArgs },
+        });
+        result = await ToolManager.execute(call.name, finalArgs);
+      }
       // For run_command results, keep the structured summary header (EXIT_CODE, NPM_ERR_CODE,
       // REMEDIATION HINT) AND the diagnostic middle so the side panel preview is still
       // useful — head/tail truncation would hide the actual npm ERR! block.
@@ -623,6 +733,25 @@ async function executeTools(state: AgentStateType): Promise<Partial<AgentStateTy
             resultPreview = resultPreview + verifySuffix;
           } catch (e: any) {
             result = result + `\n\n[AUTO-VERIFY] verify_edit failed: ${e.message}`;
+          }
+
+          // Run a targeted verification (compile) after each successful file edit/write
+          try {
+            const workspaceRoot = state.workspaceRoot || getWorkspaceRoot();
+            if (workspaceRoot) {
+              const cmds = detectVerificationCommands(workspaceRoot);
+              if (cmds.compileCommand) {
+                const compileOut = await ToolManager.execute('run_command', { command: cmds.compileCommand });
+                const failedFlagMatch = compileOut.match(/\[FAILED:\s*(true|false)\]/);
+                const failed = failedFlagMatch ? failedFlagMatch[1] === 'true' : (compileOut.includes('[COMMAND FAILED]') || compileOut.includes('[COMMAND TIMEOUT]'));
+                const compileSuffix = failed ? `\n\n[AUTO-COMPILE] ⚠️ Compile failed after this edit:\n${compileOut}` : `\n\n[AUTO-COMPILE] ✅ Compile succeeded after this edit.`;
+                result = result + compileSuffix;
+                resultPreview = resultPreview + compileSuffix;
+              }
+            }
+          } catch (e: any) {
+            result = result + `\n\n[AUTO-COMPILE] failed: ${e.message}`;
+            resultPreview = resultPreview + `\n\n[AUTO-COMPILE] failed: ${e.message}`;
           }
         }
       }
@@ -773,6 +902,14 @@ async function runCompile(state: AgentStateType): Promise<Partial<AgentStateType
     // Get live diagnostics
     const liveDiagnostics = await ToolManager.execute('get_diagnostics', {});
 
+    // Gather richer failure diagnostics (re-run, git-diff, file preview) to help reproduce/isolate
+    let richerDiagnostics = '';
+    try {
+      richerDiagnostics = await ToolManager.execute('gather_failure_diagnostics', { command: state.compileCommand, file_path: suspectedFile });
+    } catch (e: any) {
+      richerDiagnostics = `Error gathering richer diagnostics: ${e.message || e}`;
+    }
+
     const fixPrompt = `The project build failed.
 
 Failure summary (parsed from the command output, not guessed):
@@ -798,9 +935,11 @@ Instructions:
 5. Only edit files inside the workspace. Do not invent fictional npm scripts.
 6. After making changes, output the actual JSON tool call — {"name": "edit_file", "arguments": {...}} (or an array of such calls) — so the agent parser can execute it. Do not write a markdown code block; that will be ignored.`;
 
+    const fixPromptWithDiagnostics = fixPrompt + '\n\nRicher Failure Diagnostics (re-run, git-diff, file preview):\n\n``\n' + richerDiagnostics + '\n```';
+
     const fixMessage: ChatMessage = {
       role: 'user',
-      content: fixPrompt,
+      content: fixPromptWithDiagnostics,
       timestamp: Date.now(),
     };
 
@@ -883,6 +1022,14 @@ async function runTest(state: AgentStateType): Promise<Partial<AgentStateType>> 
       state.onToken?.(`\n${headerSummary}\n`);
     }
 
+    // Gather richer failure diagnostics to help reproduce/isolate test failures
+    let richerTestDiagnostics = '';
+    try {
+      richerTestDiagnostics = await ToolManager.execute('gather_failure_diagnostics', { command: state.testCommand, file_path: suspectedFile });
+    } catch (e: any) {
+      richerTestDiagnostics = `Error gathering richer diagnostics: ${e.message || e}`;
+    }
+
     const testFixPrompt = `The project tests failed.
 
 Failure summary (parsed from the command output, not guessed):
@@ -901,9 +1048,11 @@ Instructions:
 3. Otherwise look at the assertion failure: which file, which test, expected vs actual. Fix the code under test (not the test expectations) unless the test expectation itself is wrong.
 4. Output the actual JSON tool call — {"name": "edit_file", "arguments": {...}} (or an array of such calls) — so the agent parser can execute it. Do not write a markdown code block; that will be ignored.`;
 
+    const testFixPromptWithDiagnostics = testFixPrompt + '\n\nRicher Failure Diagnostics (re-run, git-diff, file preview):\n\n``\n' + richerTestDiagnostics + '\n```';
+
     const fixMessage: ChatMessage = {
       role: 'user',
-      content: testFixPrompt,
+      content: testFixPromptWithDiagnostics,
       timestamp: Date.now(),
     };
 
@@ -970,13 +1119,13 @@ ${diffOutput}
 
   try {
     const settings = AIService.getSettings();
-    const plannerModel = settings.plannerModel || settings.chatModel;
+    const coderModel = settings.coderModel || settings.chatModel;
 
     const llmResult = await AIService.streamResponseDetailed(
       [{ role: 'user', content: auditPrompt, timestamp: Date.now() }],
       auditSystemPrompt,
       (token) => {},
-      state.modelConfig?.modelId || plannerModel || undefined,
+      state.modelConfig?.modelId || coderModel || undefined,
       state.modelConfig?.provider || undefined,
       state.modelConfig?.temperature,
       undefined,
@@ -1018,9 +1167,93 @@ ${diffOutput}
   }
 }
 
+/**
+ * Node: runGeneralReview
+ * Non-security review pass focusing on correctness, maintainability, API design,
+ * and style. Runs on the current git diff and asks the model to flag issues and
+ * output either NO_REVIEW_ISSUES_FOUND or a list of fixes. If issues are found,
+ * the agent is prompted to produce JSON tool calls to apply fixes.
+ */
+async function runGeneralReview(state: AgentStateType): Promise<Partial<AgentStateType>> {
+  if (!state.isRunning || state.checkCancellation?.()) {
+    return { isRunning: false, reviewCompleted: true };
+  }
+
+  // Skip review if no changes were made or if we've reached max reviews
+  if (!state.codeChangesMade || state.reviewAttempt >= state.maxReviews || state.currentSubagentId === 'security-reviewer') {
+    return { reviewCompleted: true };
+  }
+
+  state.onToken?.('\n\n🧐 **General Review Triggered:** Running a non-security review pass on the code changes...\n');
+
+  AgentTrace.append({
+    runId: state.runId || 'unknown',
+    sessionId: state.sessionId,
+    type: 'general_review_start',
+    timestamp: Date.now(),
+    data: { attempt: state.reviewAttempt + 1 },
+  });
+
+  const diffOutput = await ToolManager.execute('git_diff', {});
+  if (!diffOutput || diffOutput.trim() === '' || diffOutput.startsWith('Error')) {
+    state.onToken?.('✨ **General Review Skipped:** No uncommitted changes detected to review.\n');
+    return { reviewCompleted: true };
+  }
+
+  const attemptNum = state.reviewAttempt + 1;
+
+  const systemPrompt = `You are a senior code reviewer. Review the following git diff for correctness, maintainability, API design, duplication, and unclear abstractions. For each issue, cite file and approximate line numbers, explain the problem succinctly, and propose a fix. If the diff is clean and has no actionable issues, output the exact word: NO_REVIEW_ISSUES_FOUND.`;
+
+  const reviewPrompt = `Please review the following code diff:\n\n\`\`\`diff\n${diffOutput}\n\`\`\``;
+
+  try {
+    const settings = AIService.getSettings();
+    const coderModel = settings.coderModel || settings.chatModel;
+
+    const llmResult = await AIService.streamResponseDetailed(
+      [{ role: 'user', content: reviewPrompt, timestamp: Date.now() }],
+      systemPrompt,
+      () => {},
+      state.modelConfig?.modelId || coderModel || undefined,
+      state.modelConfig?.provider || undefined,
+      0.2,
+      undefined,
+      { enableTools: false }
+    );
+
+    const reviewerOutput = llmResult.text.trim();
+    if (reviewerOutput.includes('NO_REVIEW_ISSUES_FOUND')) {
+      state.onToken?.('\n✨ **General Review Passed:** No significant maintainability or API issues found.\n');
+      return { reviewCompleted: true, reviewAttempt: attemptNum };
+    } else {
+      state.onToken?.(`\n⚠️ **General Review Found Potential Issues (Attempt ${attemptNum}/${state.maxReviews}):**\n${reviewerOutput}\n`);
+      const fixMessage: ChatMessage = {
+        role: 'user',
+        content: `The general reviewer identified the following issues:\n\n${reviewerOutput}\n\nYou MUST fix these issues. Output the JSON tool call(s) to apply the fixes.`,
+        timestamp: Date.now(),
+      };
+
+      return {
+        chatHistory: [fixMessage],
+        reviewCompleted: false,
+        reviewAttempt: attemptNum,
+        compileCompleted: false,
+        testCompleted: false,
+      };
+    }
+  } catch (err: any) {
+    state.onToken?.(`\n\n❌ **General Review Error:** ${err.message}\n`);
+    return { reviewCompleted: true, reviewAttempt: attemptNum };
+  }
+}
+
 function routeToFinalizeOrAudit(state: AgentStateType): string {
   if (state.codeChangesMade && !state.auditCompleted && state.auditAttempt < state.maxAudits && state.currentSubagentId !== 'security-reviewer') {
     return 'runSecurityAudit';
+  }
+  // If code changes were made and security audit completed, run a general review pass
+  if (state.codeChangesMade && !state.reviewCompleted && state.reviewAttempt < state.maxReviews) {
+    return 'runGeneralReview';
   }
   return 'finalize';
 }
@@ -1062,6 +1295,185 @@ function findTaskFile(dir: string, depth = 0): string | null {
     // Ignore
   }
   return null;
+}
+
+function extractInitialUserPrompt(chatHistory: ChatMessage[]): string {
+  const fullUserContent = chatHistory.find(m => m.role === 'user')?.content || '';
+  const userRequestMatch = fullUserContent.match(/User Request:\n([\s\S]*)$/);
+  return userRequestMatch ? userRequestMatch[1] : fullUserContent;
+}
+
+function shouldGenerateImplementationPlan(state: AgentStateType): boolean {
+  const prompt = extractInitialUserPrompt(state.chatHistory).trim();
+  if (!prompt) return false;
+
+  const nonTrivialIndicators = [
+    /\b(create|build|implement|refactor|rewrite|redesign|add|remove|update|fix|migrate|extend)\b/i,
+    /\b(api|component|page|screen|route|feature|workflow|model|service|test|tool|agent)\b/i,
+    /\b(multi-file|workspace|monorepo|architecture|roadmap|plan)\b/i,
+  ];
+
+  return prompt.length >= 80 || nonTrivialIndicators.some(pattern => pattern.test(prompt));
+}
+
+function formatPlanFiles(plan: {
+  title: string;
+  summary: string;
+  tasks: string[];
+  verification: string[];
+}): { implementationPlan: string; taskList: string } {
+  const implementationPlan = [
+    `# ${plan.title}`,
+    '',
+    '## Summary',
+    plan.summary.trim(),
+    '',
+    '## Tasks',
+    ...plan.tasks.map(task => `- [ ] ${task}`),
+    '',
+    '## Verification',
+    ...plan.verification.map(step => `- ${step}`),
+  ].join('\n');
+
+  const taskList = [
+    '# Task List',
+    ...plan.tasks.map(task => `- [ ] ${task}`),
+  ].join('\n');
+
+  return { implementationPlan, taskList };
+}
+
+async function prepareImplementationPlan(state: AgentStateType): Promise<Partial<AgentStateType>> {
+  if (!state.isRunning || state.checkCancellation?.()) {
+    return {};
+  }
+
+  const workspaceRoot = state.workspaceRoot || getWorkspaceRoot();
+  if (!workspaceRoot || !shouldGenerateImplementationPlan(state)) {
+    return { implementationPlanSummary: '' };
+  }
+
+  const prompt = extractInitialUserPrompt(state.chatHistory).trim();
+  const planDir = path.join(workspaceRoot, '.k-horizon');
+  const planPath = path.join(planDir, 'implementation_plan.md');
+  const taskPath = path.join(planDir, 'task.md');
+
+  const fallbackPlan = {
+    title: 'Implementation Plan',
+    summary: `Implement the user's request: ${prompt}`,
+    tasks: [
+      'Inspect the relevant files and current implementation',
+      'Make the required code changes',
+      'Run compile and targeted tests',
+      'Write a brief walkthrough of the changes',
+    ],
+    verification: ['npm run compile', 'npm run test:unit'],
+  };
+
+  try {
+    fs.mkdirSync(planDir, { recursive: true });
+
+    const settings = AIService.getSettings();
+    const plannerModel = state.modelConfig?.modelId || settings.plannerModel || settings.chatModel || undefined;
+    const provider = state.modelConfig?.provider || settings.provider || undefined;
+    const systemPrompt = `You are a senior software planner.
+Create a concise implementation plan for the user's request.
+
+Return ONLY valid JSON with this shape:
+{
+  "title": "Short title",
+  "summary": "2-4 sentence summary of the approach",
+  "tasks": ["task 1", "task 2"],
+  "verification": ["step 1", "step 2"]
+}
+
+Rules:
+- Keep tasks concrete and ordered.
+- Prefer small, verifiable steps.
+- Include verification steps that match the repo's compile/test workflow.`;
+
+    // Inject continuous learnings into the planner system prompt so past corrections
+    // and rules influence planning and tool selection.
+    let plannerSystemPrompt = systemPrompt;
+    try {
+      const learningsPrompt = await AgentLearningManager.loadLearningsAsPrompt(workspaceRoot);
+      if (learningsPrompt) plannerSystemPrompt = plannerSystemPrompt + '\n\n' + learningsPrompt;
+    } catch {}
+
+    const llmResult = await AIService.streamResponseDetailed(
+      [{ role: 'user', content: `User request:\n${prompt}`, timestamp: Date.now() }],
+      plannerSystemPrompt,
+      () => {},
+      plannerModel,
+      provider,
+      0.2,
+      undefined,
+      { enableTools: false }
+    );
+
+    const rawText = ToolManager.stripReasoningFromText(llmResult.text || '');
+    const match = rawText.match(/\{[\s\S]*\}/);
+
+    let parsed = fallbackPlan;
+    if (match) {
+      try {
+        const candidate = JSON.parse(match[0]);
+        if (candidate && typeof candidate === 'object') {
+          const tasks = Array.isArray(candidate.tasks) ? candidate.tasks.map(String).filter(Boolean) : fallbackPlan.tasks;
+          const verification = Array.isArray(candidate.verification) ? candidate.verification.map(String).filter(Boolean) : fallbackPlan.verification;
+          parsed = {
+            title: typeof candidate.title === 'string' && candidate.title.trim() ? candidate.title.trim() : fallbackPlan.title,
+            summary: typeof candidate.summary === 'string' && candidate.summary.trim() ? candidate.summary.trim() : fallbackPlan.summary,
+            tasks: tasks.length > 0 ? tasks : fallbackPlan.tasks,
+            verification: verification.length > 0 ? verification : fallbackPlan.verification,
+          };
+        }
+      } catch {
+        parsed = fallbackPlan;
+      }
+    }
+
+    const formatted = formatPlanFiles(parsed);
+    fs.writeFileSync(planPath, formatted.implementationPlan, 'utf8');
+    fs.writeFileSync(taskPath, formatted.taskList, 'utf8');
+
+    return {
+      implementationPlanSummary: [
+        `# ${parsed.title}`,
+        '',
+        parsed.summary,
+        '',
+        '## Tasks',
+        ...parsed.tasks.map(task => `- ${task}`),
+        '',
+        '## Verification',
+        ...parsed.verification.map(step => `- ${step}`),
+      ].join('\n'),
+    };
+  } catch (err: any) {
+    console.error('[prepareImplementationPlan] Failed to create plan files:', err);
+    const formatted = formatPlanFiles(fallbackPlan);
+    try {
+      fs.mkdirSync(planDir, { recursive: true });
+      fs.writeFileSync(planPath, formatted.implementationPlan, 'utf8');
+      fs.writeFileSync(taskPath, formatted.taskList, 'utf8');
+    } catch {
+      // ignore fallback write errors
+    }
+    return {
+      implementationPlanSummary: [
+        `# ${fallbackPlan.title}`,
+        '',
+        fallbackPlan.summary,
+        '',
+        '## Tasks',
+        ...fallbackPlan.tasks.map(task => `- ${task}`),
+        '',
+        '## Verification',
+        ...fallbackPlan.verification.map(step => `- ${step}`),
+      ].join('\n'),
+    };
+  }
 }
 
 export function routeAfterParse(state: AgentStateType): string {
@@ -1143,20 +1555,14 @@ export function routeFromSelfHeal(state: AgentStateType): string {
 export function routeAfterCompile(state: AgentStateType): string {
   if (!state.isRunning) return 'finalize';
   if (!state.compileCompleted) return 'callLLM';
-  
+
   const fullUserContent = state.chatHistory.find(m => m.role === 'user')?.content || '';
   const userRequestMatch = fullUserContent.match(/User Request:\n([\s\S]*)$/);
   const initialUserPrompt = userRequestMatch ? userRequestMatch[1] : fullUserContent;
   const explicitlyRequestedTest = /test|spec/i.test(initialUserPrompt);
-  
+
   const shouldTest = state.autoTest && !state.testCompleted && (state.codeChangesMade || explicitlyRequestedTest);
   if (shouldTest) return 'runTest';
-  return routeToFinalizeOrAudit(state);
-}
-
-export function routeAfterTest(state: AgentStateType): string {
-  if (!state.isRunning) return 'finalize';
-  if (!state.testCompleted) return 'callLLM';
   return routeToFinalizeOrAudit(state);
 }
 
@@ -1313,6 +1719,7 @@ async function finalize(_state: AgentStateType): Promise<Partial<AgentStateType>
  */
 export function createAgentGraph() {
   const workflow = new StateGraph(AgentState)
+    .addNode('prepareImplementationPlan', prepareImplementationPlan)
     .addNode('callLLM', callLLM)
     .addNode('parseToolCalls', parseToolCalls)
     .addNode('executeTools', executeTools)
@@ -1323,9 +1730,11 @@ export function createAgentGraph() {
     .addNode('runCompile', runCompile)
     .addNode('runTest', runTest)
     .addNode('runSecurityAudit', runSecurityAudit)
+    .addNode('runGeneralReview', runGeneralReview)
     .addNode('finalize', finalize)
 
-    .addEdge(START, 'callLLM')
+    .addEdge(START, 'prepareImplementationPlan')
+    .addEdge('prepareImplementationPlan', 'callLLM')
     .addEdge('callLLM', 'parseToolCalls')
 
     .addConditionalEdges('parseToolCalls', routeAfterParse, {
@@ -1355,6 +1764,7 @@ export function createAgentGraph() {
       callLLM: 'callLLM',
       runTest: 'runTest',
       runSecurityAudit: 'runSecurityAudit',
+      runGeneralReview: 'runGeneralReview',
       finalize: 'finalize',
     })
 
@@ -1365,6 +1775,17 @@ export function createAgentGraph() {
     })
 
     .addConditionalEdges('runSecurityAudit', routeAfterAudit, {
+      callLLM: 'callLLM',
+      runGeneralReview: 'runGeneralReview',
+      finalize: 'finalize',
+    })
+
+    .addConditionalEdges('runGeneralReview', (s: AgentStateType) => {
+      if (!s.isRunning) return 'finalize';
+      // If review is not completed, we want the model to respond (callLLM) so it can emit fixes;
+      // otherwise finalize.
+      return s.reviewCompleted ? 'finalize' : 'callLLM';
+    }, {
       callLLM: 'callLLM',
       finalize: 'finalize',
     })

@@ -13,6 +13,7 @@ import { DBClient } from './db-client';
 import { AgentLearningManager } from './learning-manager';
 import { AIService } from './ai-service';
 import { detectVerificationCommands } from './verification-commands';
+import { getWorkspaceRoot } from './workspace-utils';
 
 export interface ToolCall {
   name: string;
@@ -101,7 +102,9 @@ export class ToolManager {
     db_query: ['query'],
     db_status: [],
     get_learning_rules: [],
+    find_learning_rules: ['query'],
     add_learning_rule: ['mistake', 'correction'],
+    gather_failure_diagnostics: ['command'],
     delete_learning_rule: ['rule_id'],
     get_vscode_settings: [],
     update_vscode_settings: ['key', 'value_json'],
@@ -462,6 +465,21 @@ export class ToolManager {
         key: { type: 'string', description: 'Optional specific setting key to fetch (e.g. "chatModel"). If omitted, all settings are returned.' }
       }
     },
+    find_learning_rules: {
+      description: 'Find matching agent learning rules by a query string. Returns matching learnings as JSON.',
+      required: ['query'],
+      properties: {
+        query: { type: 'string', description: 'Search query to filter learning rules (case-insensitive substring match).' }
+      }
+    },
+    gather_failure_diagnostics: {
+      description: 'Gather failure diagnostics for a failing command: run the command verbosely, collect vscode diagnostics and git diff, and return a consolidated report.',
+      required: ['command'],
+      properties: {
+        command: { type: 'string', description: 'The failing shell command to re-run for additional diagnostics (e.g. "npm run compile").' },
+        file_path: { type: 'string', description: 'Optional file path suspected to be involved in the failure.' }
+      }
+    },
     update_vscode_settings: {
       description: 'Update a specific K-Horizon user configuration setting.',
       required: ['key', 'value_json'],
@@ -495,7 +513,7 @@ export class ToolManager {
   }
 
   private static getDynamicToolsDir(): string {
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    const workspaceRoot = getWorkspaceRoot();
     const dir = path.join(workspaceRoot, '.k-horizon', 'dynamic-tools');
     if (!fs.existsSync(dir)) {
       fs.mkdirSync(dir, { recursive: true });
@@ -564,6 +582,9 @@ export class ToolManager {
       required: spec.required,
       additionalProperties: false,
     };
+
+    // New helper tool: find_learning_rules
+    this['find_learning_rules'] = [];
 
     if (format === 'anthropic') {
       return {
@@ -834,17 +855,12 @@ export class ToolManager {
       return args;
     };
 
-    // List of known tool names to scan for direct tags
-    const knownTools = [
-      'list_dir', 'read_file', 'write_file', 'edit_file', 'delete_file',
-      'grep_search', 'web_search', 'fetch_webpage', 'run_command',
-      'get_active_editor_context', 'get_diagnostics', 'preview_html',
-      'execute_vscode_command', 'find_files', 'get_file_outline',
-      'git_status', 'git_diff', 'web_scrape', 'get_library_docs',
-      'search_workspace_symbols', 'find_references', 'find_definitions',
-      'show_info_message', 'get_vscode_extensions', 'send_to_terminal',
-      'open_file_to_side', 'verify_edit'
-    ];
+    // Build the direct-tag tool name list from every built-in tool schema so
+    // the XML fallback stays aligned when new tools are added.
+    const knownTools = Array.from(new Set([
+      ...Object.keys(this.requiredToolArgs),
+      ...Object.keys(this.toolSpecs),
+    ]));
 
     // 1. Try parsing standard <tool_call name="..."> tags
     // We use a flexible closing tag: </tool_call>, </｜DSML｜_tool>, </｜DSML｜_tool_call>, or EOF
@@ -916,7 +932,7 @@ export class ToolManager {
     if (path.isAbsolute(cleanPath)) {
       return cleanPath;
     }
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    const workspaceRoot = getWorkspaceRoot();
     return path.join(workspaceRoot, cleanPath);
   }
 
@@ -925,7 +941,7 @@ export class ToolManager {
       return { ok: false, error: `Error: ${label} argument is missing` };
     }
 
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const workspaceRoot = getWorkspaceRoot();
     if (!workspaceRoot) {
       return { ok: false, error: 'Error: No workspace folder open' };
     }
@@ -1183,6 +1199,10 @@ export class ToolManager {
           return await this.dbStatus();
         case 'get_learning_rules':
           return await this.getLearningRules();
+        case 'find_learning_rules':
+          return await this.findLearningRules(args.query);
+        case 'gather_failure_diagnostics':
+          return await this.gatherFailureDiagnostics(args.command, args.file_path);
         case 'add_learning_rule':
           return await this.addLearningRule(args.mistake, args.correction, args.source);
         case 'delete_learning_rule':
@@ -1267,7 +1287,7 @@ export class ToolManager {
     fs.writeFileSync(targetFile, content || '', 'utf8');
 
     if (enablePreemptiveDryRuns) {
-      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+      const workspaceRoot = getWorkspaceRoot();
       if (workspaceRoot) {
         const verifyCmds = detectVerificationCommands(workspaceRoot);
         if (verifyCmds.compileCommand) {
@@ -1367,7 +1387,7 @@ export class ToolManager {
     fs.writeFileSync(targetFile, updated, 'utf8');
 
     if (enablePreemptiveDryRuns) {
-      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+      const workspaceRoot = getWorkspaceRoot();
       if (workspaceRoot) {
         const verifyCmds = detectVerificationCommands(workspaceRoot);
         if (verifyCmds.compileCommand) {
@@ -2068,7 +2088,7 @@ export class ToolManager {
     const commandRisk = this.isDangerousCommand(command);
     if (commandRisk) return commandRisk;
 
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    const workspaceRoot = getWorkspaceRoot();
     if (!workspaceRoot) {
       return 'Error: No workspace folder open to run commands';
     }
@@ -2630,7 +2650,7 @@ export class ToolManager {
   }
 
   private static async gitStatus(): Promise<string> {
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    const workspaceRoot = getWorkspaceRoot();
     if (!workspaceRoot) {
       return 'Error: No workspace folder open for git';
     }
@@ -2648,7 +2668,7 @@ export class ToolManager {
   }
 
   private static async gitDiff(): Promise<string> {
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    const workspaceRoot = getWorkspaceRoot();
     if (!workspaceRoot) {
       return 'Error: No workspace folder open for git';
     }
@@ -3395,7 +3415,7 @@ export const supabase = createClient(supabaseUrl, supabaseKey);
         // Ignore if simple browser is not available
       }
 
-      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+      const workspaceRoot = getWorkspaceRoot();
       const screenshotsDir = path.join(workspaceRoot, '.k-horizon', 'screenshots');
       if (!fs.existsSync(screenshotsDir)) {
         fs.mkdirSync(screenshotsDir, { recursive: true });
@@ -3449,7 +3469,7 @@ export const supabase = createClient(supabaseUrl, supabaseKey);
       return `Error parsing patches_json: ${e.message}`;
     }
 
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    const workspaceRoot = getWorkspaceRoot();
     const originalBranch = await this.runCommand('git branch --show-current');
     const cleanBranchName = originalBranch.replace(/\[FAILED[\s\S]*$/, '').trim();
 
@@ -3511,7 +3531,7 @@ export const supabase = createClient(supabaseUrl, supabaseKey);
   }
 
   private static async updateDependencyGraph(): Promise<string> {
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    const workspaceRoot = getWorkspaceRoot();
     const graphPath = path.join(workspaceRoot, '.k-horizon', 'ast-graph.json');
     const graph: Record<string, string[]> = {};
 
@@ -3620,7 +3640,7 @@ export const supabase = createClient(supabaseUrl, supabaseKey);
     if (!resolved.ok) return resolved.error;
     const targetFile = resolved.absolutePath;
 
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    const workspaceRoot = getWorkspaceRoot();
     const fuzzDir = path.join(workspaceRoot, '.k-horizon', 'fuzz-tests');
     if (!fs.existsSync(fuzzDir)) {
       fs.mkdirSync(fuzzDir, { recursive: true });
@@ -3725,7 +3745,7 @@ if (crashCount === 0) {
 
   private static async getLearningRules(): Promise<string> {
     try {
-      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+      const workspaceRoot = getWorkspaceRoot();
       if (!workspaceRoot) return 'Error: No workspace open.';
       const learnings = await AgentLearningManager.loadLearnings(workspaceRoot);
       return JSON.stringify(learnings, null, 2);
@@ -3734,9 +3754,56 @@ if (crashCount === 0) {
     }
   }
 
+  private static async findLearningRules(query?: string): Promise<string> {
+    try {
+      const workspaceRoot = getWorkspaceRoot();
+      if (!workspaceRoot) return 'Error: No workspace open.';
+      const matches = await AgentLearningManager.findMatchingLearnings(workspaceRoot, query || '');
+      return JSON.stringify(matches, null, 2);
+    } catch (err: any) {
+      return `Error: ${err.message}`;
+    }
+  }
+
+  private static async gatherFailureDiagnostics(command?: string, file_path?: string): Promise<string> {
+    try {
+      const workspaceRoot = getWorkspaceRoot();
+      const parts: string[] = [];
+      parts.push(`=== Failure Diagnostics Report ===`);
+      parts.push(`Command: ${command}`);
+      parts.push(`Workspace: ${workspaceRoot || 'unknown'}`);
+
+      if (file_path) {
+        parts.push(`Suspected file: ${file_path}`);
+        try {
+          const content = await this.readFile(file_path);
+          parts.push(`--- File preview (${file_path}) ---\n${content.slice(0, 2000)}`);
+        } catch {}
+      }
+
+      parts.push('\n--- Re-running failing command (capturing structured output) ---');
+      if (command) {
+        const cmdOut = await this.runCommand(command);
+        parts.push(cmdOut);
+      }
+
+      parts.push('\n--- Live VS Code Diagnostics ---');
+      const diag = await this.getDiagnostics(file_path);
+      parts.push(diag);
+
+      parts.push('\n--- Git Diff (uncommitted changes) ---');
+      const diff = await this.gitDiff();
+      parts.push(diff);
+
+      return parts.join('\n\n');
+    } catch (err: any) {
+      return `Error gathering diagnostics: ${err.message}`;
+    }
+  }
+
   private static async addLearningRule(mistake: string, correction: string, source?: string): Promise<string> {
     try {
-      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+      const workspaceRoot = getWorkspaceRoot();
       if (!workspaceRoot) return 'Error: No workspace open.';
       const learning = await AgentLearningManager.saveLearning(workspaceRoot, {
         mistake,
@@ -3751,7 +3818,7 @@ if (crashCount === 0) {
 
   private static async deleteLearningRule(ruleId: string): Promise<string> {
     try {
-      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+      const workspaceRoot = getWorkspaceRoot();
       if (!workspaceRoot) return 'Error: No workspace open.';
       await AgentLearningManager.deleteLearning(workspaceRoot, ruleId);
       return `Successfully deleted learning rule ${ruleId}`;

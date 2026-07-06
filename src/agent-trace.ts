@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import * as vscode from 'vscode';
+import { getWorkspaceRoot } from './workspace-utils';
 
 export type AgentTraceEvent = {
   runId: string;
@@ -17,7 +18,7 @@ export class AgentTrace {
 
   public static append(event: AgentTraceEvent): void {
     try {
-      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+      const workspaceRoot = getWorkspaceRoot();
       if (!workspaceRoot) return;
 
       const traceDir = path.join(workspaceRoot, '.k-horizon', 'runs');

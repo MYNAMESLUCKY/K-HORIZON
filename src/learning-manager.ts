@@ -90,6 +90,18 @@ You have accumulated the following rules/learnings from your previous runs and u
     return prompt;
   }
 
+  public static async findMatchingLearnings(workspaceRoot: string, query: string): Promise<AgentLearning[]> {
+    if (!workspaceRoot) return [];
+    try {
+      const learnings = await this.loadLearnings(workspaceRoot);
+      const q = (query || '').toLowerCase().trim();
+      if (!q) return learnings;
+      return learnings.filter(l => (l.mistake + ' ' + l.correction).toLowerCase().includes(q));
+    } catch (e) {
+      return [];
+    }
+  }
+
   /**
    * Run self-improvement reflection.
    * Analyzes the chat history to see what went wrong (e.g. compile/test failure)

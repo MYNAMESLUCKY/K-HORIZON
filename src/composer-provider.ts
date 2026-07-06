@@ -6,6 +6,7 @@ import { ToolManager } from './tool-manager';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { getWorkspaceRoot } from './workspace-utils';
 import { AgentLearningManager } from './learning-manager';
 import { ASTParser } from './ast-parser';
 
@@ -171,7 +172,7 @@ export class ComposerProvider {
    */
   private static async handleCompose(prompt: string, referencedPaths: string[], modelOverride?: string, providerOverride?: string) {
     if (!this.panel) return;
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    const workspaceRoot = getWorkspaceRoot();
 
     this.cleanupTempFiles();
     this.activeChanges = [];
@@ -248,7 +249,7 @@ export class ComposerProvider {
           }
         } else if (vp === 'virtual:git-diff') {
           try {
-            const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+            const workspaceRoot = getWorkspaceRoot();
             if (workspaceRoot) {
               const execSync = require('child_process').execSync;
               const diffOutput = execSync('git diff HEAD', { cwd: workspaceRoot, encoding: 'utf8', timeout: 5000 });

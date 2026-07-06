@@ -34,12 +34,70 @@ export interface SubagentProfile {
   pinnedSkillIds: string[];
 }
 
-const ALL_TOOLS = [
-  'read_file', 'write_file', 'edit_file', 'multi_edit_file',
-  'list_dir', 'search_files', 'grep_search', 'run_command',
-  'git_status', 'git_diff', 'git_commit', 'git_push',
-  'mcp_call', 'web_search', 'fetch_webpage', 'ask_user',
+const COMMON_TOOLS = [
+  'read_file',
+  'write_file',
+  'edit_file',
+  'delete_file',
+  'list_dir',
+  'grep_search',
+  'find_files',
+  'run_command',
+  'git_status',
+  'git_diff',
+  'web_search',
+  'fetch_webpage',
+  'web_scrape',
+  'get_library_docs',
+  'get_active_editor_context',
+  'get_diagnostics',
+  'get_file_outline',
+  'search_workspace_symbols',
+  'find_references',
+  'find_definitions',
+  'show_info_message',
+  'get_vscode_extensions',
+  'send_to_terminal',
+  'open_file_to_side',
+  'preview_html',
+  'execute_vscode_command',
+  'verify_edit',
+  'switch_subagent',
+  'create_webhook_token',
+  'get_webhook_requests',
+  'patch_file_lines',
+  'insert_file_lines',
+  'copy_file',
+  'move_file',
+  'run_speculative_patch',
+  'synthesize_custom_tool',
+  'capture_page_screenshot',
+  'run_speculative_workspace_patch',
+  'update_dependency_graph',
+  'request_hunk_reviews',
+  'run_fuzz_test',
+  'db_query',
+  'db_status',
+  'get_learning_rules',
+  'add_learning_rule',
+  'delete_learning_rule',
+  'get_vscode_settings',
+  'update_vscode_settings',
+  'toggle_autocomplete',
+  'mcp__*',
 ];
+
+export function isToolAllowedForSubagent(subagentId: SubagentId, toolName: string): boolean {
+  const profile = SUBAGENTS.find(sub => sub.id === subagentId);
+  if (!profile) return false;
+  return profile.toolAllowList.some(pattern => {
+    if (pattern === toolName) return true;
+    if (pattern.endsWith('*')) {
+      return toolName.startsWith(pattern.slice(0, -1));
+    }
+    return false;
+  });
+}
 
 export const SUBAGENTS: SubagentProfile[] = [
   {
@@ -52,7 +110,7 @@ export const SUBAGENTS: SubagentProfile[] = [
       'states. Prefer Tailwind utility classes. Never use placeholder code. ' +
       'To fetch the latest, up-to-date documentation on frontend libraries (React, Tailwind, Next, etc.), ' +
       'always query the Context7 MCP server using its "query-docs" tool.',
-    toolAllowList: ALL_TOOLS,
+    toolAllowList: COMMON_TOOLS,
     triggers: ['react', 'next', 'nextjs', 'css', 'tailwind', 'html', 'landing',
                'page', 'ui', 'ux', 'component', 'frontend', 'hero', 'pricing',
                'marketing', 'homepage', 'style', 'design', 'responsive',
@@ -70,7 +128,7 @@ export const SUBAGENTS: SubagentProfile[] = [
       'queries. Never log secrets. Produce migrations and tests alongside code. ' +
       'To fetch the latest backend library, database client, or configuration documentation (Express, Postgres, Prisma, etc.), ' +
       'always query the Context7 MCP server using its "query-docs" tool.',
-    toolAllowList: ALL_TOOLS,
+    toolAllowList: COMMON_TOOLS,
     triggers: ['api', 'endpoint', 'rest', 'graphql', 'crud', 'server', 'backend',
                'database', 'postgres', 'mysql', 'redis', 'queue', 'auth', 'login',
                'signup', 'webhook', 'fastify', 'express', 'lambda', 'worker'],
@@ -87,7 +145,7 @@ export const SUBAGENTS: SubagentProfile[] = [
       'Always include offline / error states in mobile UI. ' +
       'To fetch the latest React Native or Expo documentation, ' +
       'always query the Context7 MCP server using its "query-docs" tool.',
-    toolAllowList: ALL_TOOLS,
+    toolAllowList: COMMON_TOOLS,
     triggers: ['mobile', 'ios', 'android', 'react-native', 'expo', 'swift',
                'running', 'native', 'app store', 'play store', 'push notification'],
     pinnedSkillIds: ['callstack-rn', 'expo-ui', 'expo-deploy', 'better-auth'],
@@ -102,7 +160,7 @@ export const SUBAGENTS: SubagentProfile[] = [
       'Cite file:line for every finding. Suggest minimal patches. ' +
       'To fetch package vulnerabilities, security advisories, or API specs, ' +
       'query the Context7 MCP server using its "query-docs" tool.',
-    toolAllowList: ALL_TOOLS,
+    toolAllowList: COMMON_TOOLS,
     triggers: ['security', 'audit', 'vulnerability', 'cve', 'owasp', 'review',
                'penetration', 'pentest', 'threat model', 'secrets', 'xss',
                'sql injection', 'csrf', 'ssrf'],
@@ -118,7 +176,7 @@ export const SUBAGENTS: SubagentProfile[] = [
       'tests that always pass — assert specific outcomes. ' +
       'To fetch the latest Vitest, Playwright, or Jest API documentation, ' +
       'always query the Context7 MCP server using its "query-docs" tool.',
-    toolAllowList: ALL_TOOLS,
+    toolAllowList: COMMON_TOOLS,
     triggers: ['test', 'tests', 'spec', 'coverage', 'vitest', 'jest', 'playwright',
                'e2e', 'unit test', 'integration test', 'snapshot'],
     pinnedSkillIds: ['claude-webapp-test', 'tob-pbt', 'testing-tools'],
@@ -133,7 +191,7 @@ export const SUBAGENTS: SubagentProfile[] = [
       'loop before declaring success. ' +
       'To fetch the latest, up-to-date documentation on any library or language feature, ' +
       'always query the Context7 MCP server using its "query-docs" tool.',
-    toolAllowList: ALL_TOOLS,
+    toolAllowList: COMMON_TOOLS,
     triggers: [],
     pinnedSkillIds: ['ms-typescript', 'project-scaffold'],
   },

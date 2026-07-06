@@ -113,6 +113,21 @@ describe('ToolManager.parseToolCalls', () => {
       },
     ]);
   });
+
+  it('parses direct tags for newly supported tools like delete_file', () => {
+    const calls = ToolManager.parseToolCalls(`<delete_file>
+  <file_path>src/old.ts</file_path>
+</delete_file>`);
+
+    expect(calls).toEqual([
+      {
+        name: 'delete_file',
+        arguments: {
+          file_path: 'src/old.ts',
+        },
+      },
+    ]);
+  });
 });
 
 describe('ToolManager native tool calls', () => {

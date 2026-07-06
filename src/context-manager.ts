@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import { WorkspaceFile } from './types';
 import { AIService } from './ai-service';
 import { DBClient } from './db-client';
+import { getWorkspaceRoot } from './workspace-utils';
 
 export class ContextManager {
   private static summaryCache = new Map<string, { summary: string; mtime: number }>();
@@ -70,7 +71,7 @@ export class ContextManager {
    * hard-coded exclusion list.
    */
   public static async getWorkspaceFiles(maxResults = 2000): Promise<WorkspaceFile[]> {
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    const workspaceRoot = getWorkspaceRoot();
     const gitignore = workspaceRoot ? this.loadGitignore(workspaceRoot) : [];
 
     const files = await vscode.workspace.findFiles(

@@ -3,6 +3,7 @@ import { spawn, ChildProcess } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import { AIService } from './ai-service';
+import { getWorkspaceRoot } from './workspace-utils';
 
 export interface McpServerConfig {
   name: string;
@@ -220,7 +221,7 @@ export class MCPManager {
           env['PUPPETEER_SKIP_CHROMIUM_DOWNLOAD'] = 'true';
         }
       }
-      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+      const workspaceRoot = getWorkspaceRoot();
       let command = config.command;
       let args = [...config.args];
 

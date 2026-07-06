@@ -27,6 +27,7 @@ import { ASTParser } from './ast-parser';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
+import { getWorkspaceRoot } from './workspace-utils';
 
 export class SidebarProvider implements vscode.WebviewViewProvider {
   public static readonly viewType = 'k-horizon-chat-view';
@@ -91,7 +92,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
   /** Returns the current workspace root path. */
   public getWorkspaceRoot(): string {
-    return vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    return getWorkspaceRoot();
   }
 
   /** Resolves a pending tool-debug approval prompt. */
@@ -435,7 +436,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
 
     const settings = AIService.getSettings();
     const config = vscode.workspace.getConfiguration('k-horizon');
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    const workspaceRoot = getWorkspaceRoot();
     let workspaceFileCount = 0;
     let diagnosticCount = 0;
     let errorCount = 0;
@@ -600,7 +601,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       if (path.isAbsolute(filePath)) {
         uri = vscode.Uri.file(filePath);
       } else {
-        const rootPath = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+        const rootPath = getWorkspaceRoot();
         uri = vscode.Uri.file(path.join(rootPath, filePath));
       }
       const document = await vscode.workspace.openTextDocument(uri);
@@ -705,7 +706,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     const autoTest = config.get<boolean>('autoTest', false);
     const stepDebug = config.get<boolean>('stepDebug', false);
 
-    const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '';
+    const workspaceRoot = getWorkspaceRoot();
 
     try {
       // Build session title from the first query (limited to 30 chars)
@@ -881,7 +882,7 @@ Here are the available slash commands you can use in the chat:
           }
         } else if (vp === 'virtual:git-diff') {
           try {
-            const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+            const workspaceRoot = getWorkspaceRoot();
             if (workspaceRoot) {
               const execSync = require('child_process').execSync;
               const diffOutput = execSync('git diff HEAD', { cwd: workspaceRoot, encoding: 'utf8', timeout: 5000 });
@@ -1160,7 +1161,7 @@ ${rolePrompt}
 ${codingStandardsBlock}
 Rules:
 1. Provide extremely concise explanations. Cut conversational filler.
-2. For any file modifications (creating, writing, editing, or deleting files) or running commands, you MUST use the corresponding XML tool call format. Do not write markdown code blocks for file modifications.
+2. For any file modifications (creating, writing, editing, or deleting files) or running commands, you MUST use the JSON tool-call contract: {"name":"tool_name","arguments":{...}}. Legacy XML tool calls are still supported, but JSON is preferred. Do not write markdown code blocks for file modifications.
 3. Write clean, production-ready code and apply changes via tool calls directly rather than asking the user to copy/paste or write them manually.
 4. When writing code snippets that are NOT meant to be written to files, specify the language in the markdown block (e.g. \`\`\`typescript).
 5. Do NOT compromise on code quality or completeness to save tokens. Never use placeholders or comments like '// rest of code remains the same' to truncate code blocks. Always provide complete, working implementations in all code blocks and file edits.
@@ -1371,14 +1372,14 @@ Instructions for Tool Calls:
         mcpToolsPrompt = `\n\nYou also have access to the following external MCP (Model Context Protocol) tools from connected servers:\n`;
         mcpTools.forEach((tool, index) => {
           mcpToolsPrompt += `\n${index + 27}. Call tool "${tool.name}" on server "${tool.serverName}" (${tool.description || 'no description'}):\n`;
-          mcpToolsPrompt += `<tool_call name="mcp__${tool.serverName}__${tool.name}">\n`;
+          mcpToolsPrompt += `{"name":"mcp__${tool.serverName}__${tool.name}","arguments":{}}\n`;
           if (tool.inputSchema && tool.inputSchema.properties) {
             Object.keys(tool.inputSchema.properties).forEach(propName => {
               const prop = tool.inputSchema.properties[propName];
-              mcpToolsPrompt += `  <${propName}>[${prop.type}${prop.description ? ': ' + prop.description : ''}]</${propName}>\n`;
+              mcpToolsPrompt += `  - ${propName}: [${prop.type}${prop.description ? ': ' + prop.description : ''}]\n`;
             });
           }
-          mcpToolsPrompt += `</tool_call>\n`;
+          mcpToolsPrompt += `\n`;
         });
       }
       systemInstruction += mcpToolsPrompt;
