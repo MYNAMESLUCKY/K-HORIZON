@@ -2,7 +2,7 @@
   "name": "k-horizon",
   "displayName": "K-HORIZON",
   "description": "Token-efficient, customizable AI coding assistant with inline edits, sidebar chat, composer, and autocomplete.",
-  "version": "1.0.1",
+  "version": "1.1.1",
   "publisher": "k-horizon",
   "engines": {
     "vscode": "^1.85.0"
@@ -133,10 +133,32 @@
           "default": "",
           "description": "API key for your selected provider (leave blank for Ollama)."
         },
-        "k-horizon.stitchApiKey": {
+        "k-horizon.embeddingProvider": {
+          "type": "string",
+          "default": "AICredits",
+          "enum": [
+            "AICredits",
+            "OpenAI",
+            "Gemini",
+            "Ollama",
+            "Custom"
+          ],
+          "description": "API provider for generating codebase vector embeddings."
+        },
+        "k-horizon.embeddingModel": {
+          "type": "string",
+          "default": "baai/bge-m3",
+          "description": "Model ID to use for generating vector embeddings."
+        },
+        "k-horizon.embeddingApiKey": {
           "type": "string",
           "default": "",
-          "description": "Optional API Key for Google Labs Stitch integration."
+          "description": "API Key for the embedding provider (leaves empty if using aicreditsApiKey or local Ollama)."
+        },
+        "k-horizon.embeddingBaseURL": {
+          "type": "string",
+          "default": "",
+          "description": "Custom API endpoint URL for the embedding provider."
         },
         "k-horizon.baseURL": {
           "type": "string",

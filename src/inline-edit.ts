@@ -1,4 +1,7 @@
 import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
 import { AIService } from './ai-service';
 import { ContextManager } from './context-manager';
 import { DiffHandler } from './diff-handler';
@@ -8,6 +11,7 @@ export class InlineEditManager {
   private static removedDecoration: vscode.TextEditorDecorationType;
   private static isEditActive = false;
   private static originalText = '';
+  private static originalFileContent = '';
   private static originalRange: vscode.Range;
   private static currentRange: vscode.Range;
   private static activeEditor: vscode.TextEditor | undefined;
@@ -68,6 +72,7 @@ export class InlineEditManager {
     this.activeEditor = editor;
     this.isEditActive = true;
     this.originalText = context.selectionText;
+    this.originalFileContent = editor.document.getText();
 
     // Save range of selection (convert empty selection to active line)
     const selection = editor.selection;
@@ -161,13 +166,34 @@ ${context.selectionText}
         const newEndPosition = editor.document.positionAt(newEndOffset);
         this.currentRange = new vscode.Range(this.originalRange.start, newEndPosition);
 
-        // Highlight new text
-        editor.setDecorations(this.addedDecoration, [this.currentRange]);
+        // Highlight only the added ranges
+        try {
+          const diffLines = DiffHandler.generateLineDiff(this.originalText, diffBlocks[0].replaceContent);
+          const addedRanges: vscode.Range[] = [];
+          let currentLine = this.originalRange.start.line;
+          for (const line of diffLines) {
+            if (line.type === 'normal') {
+              currentLine++;
+            } else if (line.type === 'added') {
+              if (currentLine < editor.document.lineCount) {
+                const lineObj = editor.document.lineAt(currentLine);
+                addedRanges.push(lineObj.range);
+              }
+              currentLine++;
+            }
+          }
+          editor.setDecorations(this.addedDecoration, addedRanges);
+        } catch (decorErr) {
+          // Fallback to highlighting the entire current range
+          editor.setDecorations(this.addedDecoration, [this.currentRange]);
+        }
         
-        vscode.window.showInformationMessage('Edit applied. Press Enter to Accept, Escape to Undo.', 'Accept', 'Undo')
+        vscode.window.showInformationMessage('Edit applied. Press Enter to Accept, Escape to Undo.', 'Accept', 'View Diff', 'Undo')
           .then(selection => {
             if (selection === 'Accept') {
               this.acceptEdit();
+            } else if (selection === 'View Diff') {
+              this.showNativeDiff();
             } else if (selection === 'Undo') {
               this.rejectEdit();
             }
@@ -211,7 +237,43 @@ ${context.selectionText}
   private static clearState() {
     this.isEditActive = false;
     this.originalText = '';
+    this.originalFileContent = '';
     this.activeEditor = undefined;
     vscode.commands.executeCommand('setContext', 'k-horizon.inInlineEditMode', false);
+  }
+
+  private static async showNativeDiff() {
+    if (!this.activeEditor) return;
+    const editor = this.activeEditor;
+    const document = editor.document;
+    const tempDir = os.tmpdir();
+    const randomId = Math.random().toString(36).substring(7);
+    const fileName = path.basename(document.uri.fsPath);
+    const tempOriginalPath = path.join(tempDir, `k_horizon_orig_${randomId}_${fileName}`);
+    const tempProposedPath = path.join(tempDir, `k_horizon_prop_${randomId}_${fileName}`);
+
+    try {
+      fs.writeFileSync(tempOriginalPath, this.originalFileContent, 'utf8');
+      fs.writeFileSync(tempProposedPath, document.getText(), 'utf8');
+
+      await vscode.commands.executeCommand(
+        'vscode.diff',
+        vscode.Uri.file(tempOriginalPath),
+        vscode.Uri.file(tempProposedPath),
+        `Diff: ${fileName} (AI Edit)`
+      );
+
+      // Offer acceptance again after opening the diff view
+      vscode.window.showInformationMessage('Reviewing changes in diff editor. Would you like to accept or undo?', 'Accept', 'Undo')
+        .then(selection => {
+          if (selection === 'Accept') {
+            this.acceptEdit();
+          } else if (selection === 'Undo') {
+            this.rejectEdit();
+          }
+        });
+    } catch (err: any) {
+      vscode.window.showErrorMessage(`Failed to open diff editor: ${err.message}`);
+    }
   }
 }

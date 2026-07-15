@@ -2,7 +2,7 @@ import * as vscode from 'vscode';
 import * as ts from 'typescript';
 import * as fs from 'fs';
 import * as path from 'path';
-import { exec } from 'child_process';
+import { exec, execSync } from 'child_process';
 import * as os from 'os';
 import * as https from 'https';
 import type { CheerioAPI } from 'cheerio';
@@ -31,6 +31,7 @@ interface ToolSchemaSpec {
 
 export class ToolManager {
   private static activeProcesses = new Set<any>();
+  public static lastParserError: string | null = null;
   private static webSearchCount = 0;
   private static activeBrowserCount = 0;
   private static browserQueue: (() => void)[] = [];
@@ -80,6 +81,7 @@ export class ToolManager {
     search_workspace_symbols: ['query'],
     find_references: ['file_path', 'line', 'character'],
     find_definitions: ['file_path', 'line', 'character'],
+    trace_symbol_dependency: ['symbol_name'],
     show_info_message: ['message'],
     get_vscode_extensions: [],
     send_to_terminal: ['command'],
@@ -88,14 +90,25 @@ export class ToolManager {
     switch_subagent: ['subagent_id'],
     create_webhook_token: [],
     get_webhook_requests: ['token_id'],
+    // ── Legacy file-modification tools ─────────────────────────────────
+    // The model only sees read_file, write_file, and edit_file in its
+    // native tool schema. These legacy entries are kept so that older
+    // tests, the in-process tool dispatcher, and any persisted tool-call
+    // transcripts still work. They are routed to the canonical
+    // implementation in `execute()` (search for `LEGACY_TOOL_ALIASES`).
     patch_file_lines: ['file_path', 'start_line', 'end_line', 'replacement_content'],
+    replace_in_files: ['query', 'replacement'],
     insert_file_lines: ['file_path', 'line_number', 'content'],
+    run_speculative_patch: ['file_path', 'target_content', 'replacement_content', 'validation_command'],
+    run_speculative_workspace_patch: ['patches_json', 'validation_command'],
+    // ──────────────────────────────────────────────────────────────────
+    get_file_metadata: ['file_path'],
+    create_directory: ['directory_path'],
+    git_diff_file: ['file_path'],
     copy_file: ['source_path', 'destination_path'],
     move_file: ['source_path', 'destination_path'],
-    run_speculative_patch: ['file_path', 'target_content', 'replacement_content', 'validation_command'],
     synthesize_custom_tool: ['tool_name', 'description', 'required_args_json', 'properties_json', 'code'],
     capture_page_screenshot: ['url'],
-    run_speculative_workspace_patch: ['patches_json', 'validation_command'],
     update_dependency_graph: [],
     request_hunk_reviews: ['diffs_json'],
     run_fuzz_test: ['file_path', 'export_name'],
@@ -110,6 +123,475 @@ export class ToolManager {
     update_vscode_settings: ['key', 'value_json'],
     toggle_autocomplete: ['enabled'],
   };
+
+  private static readonly manualAliases: Record<string, Record<string, string>> = {
+    edit_file: {
+      // file_path aliases
+      path: 'file_path',
+      file: 'file_path',
+      filename: 'file_path',
+      file_name: 'file_path',
+      filepath: 'file_path',
+      // target_content aliases – single word
+      target: 'target_content',
+      find: 'target_content',
+      search: 'target_content',
+      original: 'target_content',
+      old: 'target_content',
+      before: 'target_content',
+      existing: 'target_content',
+      current: 'target_content',
+      source: 'target_content',
+      match: 'target_content',
+      // target_content aliases – compound words (Claude, GPT, Gemini variants)
+      old_text: 'target_content',
+      old_string: 'target_content',
+      old_content: 'target_content',
+      old_code: 'target_content',
+      old_value: 'target_content',
+      search_text: 'target_content',
+      search_string: 'target_content',
+      search_content: 'target_content',
+      find_text: 'target_content',
+      find_string: 'target_content',
+      find_content: 'target_content',
+      original_text: 'target_content',
+      original_string: 'target_content',
+      original_content: 'target_content',
+      original_code: 'target_content',
+      existing_text: 'target_content',
+      existing_string: 'target_content',
+      existing_content: 'target_content',
+      existing_code: 'target_content',
+      current_text: 'target_content',
+      current_string: 'target_content',
+      current_content: 'target_content',
+      current_code: 'target_content',
+      source_text: 'target_content',
+      source_string: 'target_content',
+      source_content: 'target_content',
+      before_text: 'target_content',
+      before_content: 'target_content',
+      before_string: 'target_content',
+      content_to_replace: 'target_content',
+      text_to_replace: 'target_content',
+      string_to_replace: 'target_content',
+      code_to_replace: 'target_content',
+      match_text: 'target_content',
+      match_string: 'target_content',
+      match_content: 'target_content',
+      // replacement_content aliases – single word
+      replacement: 'replacement_content',
+      replace: 'replacement_content',
+      new: 'replacement_content',
+      after: 'replacement_content',
+      updated: 'replacement_content',
+      modified: 'replacement_content',
+      result: 'replacement_content',
+      // replacement_content aliases – compound words
+      new_text: 'replacement_content',
+      new_string: 'replacement_content',
+      new_content: 'replacement_content',
+      new_code: 'replacement_content',
+      new_value: 'replacement_content',
+      replace_text: 'replacement_content',
+      replace_string: 'replacement_content',
+      replace_content: 'replacement_content',
+      replace_with: 'replacement_content',
+      replacement_text: 'replacement_content',
+      replacement_string: 'replacement_content',
+      replacement_code: 'replacement_content',
+      updated_text: 'replacement_content',
+      updated_string: 'replacement_content',
+      updated_content: 'replacement_content',
+      updated_code: 'replacement_content',
+      modified_text: 'replacement_content',
+      modified_content: 'replacement_content',
+      modified_string: 'replacement_content',
+      after_text: 'replacement_content',
+      after_content: 'replacement_content',
+      after_string: 'replacement_content',
+      result_text: 'replacement_content',
+      result_content: 'replacement_content',
+      result_string: 'replacement_content',
+      content_replacement: 'replacement_content',
+      text_replacement: 'replacement_content',
+      insert: 'replacement_content',
+      content: 'replacement_content'
+    },
+    write_file: {
+      path: 'file_path',
+      file: 'file_path',
+      filename: 'file_path',
+      file_name: 'file_path',
+      filepath: 'file_path',
+      text: 'content',
+      code: 'content',
+      body: 'content',
+      data: 'content',
+      source: 'content',
+      file_content: 'content',
+      new_content: 'content',
+      file_contents: 'content'
+    },
+    read_file: {
+      path: 'file_path',
+      file: 'file_path',
+      filename: 'file_path',
+      file_name: 'file_path',
+      filepath: 'file_path'
+    },
+    delete_file: {
+      path: 'file_path',
+      file: 'file_path',
+      filename: 'file_path',
+      file_name: 'file_path',
+      filepath: 'file_path'
+    },
+    grep_search: {
+      search: 'query',
+      pattern: 'query',
+      term: 'query',
+      text: 'query',
+      keyword: 'query'
+    },
+    web_search: {
+      search: 'query',
+      term: 'query',
+      keyword: 'query',
+      question: 'query',
+      keywords: 'query'
+    },
+    fetch_webpage: {
+      link: 'url',
+      uri: 'url',
+      webpage: 'url',
+      address: 'url'
+    },
+    run_command: {
+      cmd: 'command',
+      shell_command: 'command',
+      terminal_command: 'command'
+    },
+    execute_vscode_command: {
+      command: 'command_id',
+      cmd: 'command_id',
+      id: 'command_id'
+    },
+    find_files: {
+      query: 'pattern',
+      glob: 'pattern',
+      search: 'pattern',
+      term: 'pattern',
+      file_pattern: 'pattern'
+    },
+    get_file_outline: {
+      path: 'file_path',
+      file: 'file_path',
+      filename: 'file_path',
+      filepath: 'file_path'
+    },
+    trace_symbol_dependency: {
+      symbol: 'symbol_name',
+      name: 'symbol_name',
+      identifier: 'symbol_name'
+    },
+    show_info_message: {
+      msg: 'message',
+      text: 'message',
+      info: 'message',
+      content: 'message'
+    },
+    send_to_terminal: {
+      cmd: 'command',
+      command_line: 'command',
+      shell_command: 'command'
+    },
+    open_file_to_side: {
+      path: 'file_path',
+      file: 'file_path',
+      filename: 'file_path',
+      filepath: 'file_path'
+    },
+    verify_edit: {
+      path: 'file_path',
+      file: 'file_path',
+      filename: 'file_path',
+      filepath: 'file_path'
+    },
+    find_references: {
+      path: 'file_path',
+      file: 'file_path',
+      filename: 'file_path',
+      filepath: 'file_path',
+      line_number: 'line',
+      col: 'character',
+      column: 'character',
+      char: 'character',
+      char_index: 'character',
+      character_offset: 'character'
+    },
+    find_definitions: {
+      path: 'file_path',
+      file: 'file_path',
+      filename: 'file_path',
+      filepath: 'file_path',
+      line_number: 'line',
+      col: 'character',
+      column: 'character',
+      char: 'character',
+      char_index: 'character',
+      character_offset: 'character'
+    },
+    switch_subagent: {
+      subagent: 'subagent_id',
+      agent: 'subagent_id',
+      id: 'subagent_id'
+    }
+  };
+
+  /**
+   * Maps for fuzzy word-segment matching for `edit_file` required args.
+   * Keys are "role words" that appear in the first segment of a compound argument
+   * name used by various LLMs. Values are the canonical parameter names.
+   */
+  private static readonly EDIT_FILE_TARGET_WORDS = new Set([
+    'old', 'original', 'existing', 'current', 'source', 'before',
+    'find', 'search', 'match', 'target'
+  ]);
+  private static readonly EDIT_FILE_REPLACEMENT_WORDS = new Set([
+    'new', 'replacement', 'replace', 'updated', 'modified', 'after',
+    'result', 'insert'
+  ]);
+
+  private static normalizeToolArguments(name: string, rawArgs: Record<string, any>): Record<string, any> {
+    const isMcp = name.startsWith('mcp__');
+
+    // 1. Get all expected keys for the tool
+    let expectedKeys: string[] = [];
+    if (isMcp) {
+      const parts = name.split('__');
+      if (parts.length >= 3) {
+        const serverName = parts[1];
+        const toolName = parts.slice(2).join('__');
+        const mcpTools = MCPManager.getAllTools();
+        const matchedMcp = mcpTools.find(t => t.serverName.toLowerCase() === serverName.toLowerCase() && t.name.toLowerCase() === toolName.toLowerCase());
+        if (matchedMcp && matchedMcp.inputSchema && matchedMcp.inputSchema.properties) {
+          expectedKeys = Object.keys(matchedMcp.inputSchema.properties);
+        }
+      }
+      if (expectedKeys.length === 0) {
+        return rawArgs;
+      }
+    } else {
+      const spec = this.toolSpecs[name];
+      if (spec && spec.properties) {
+        expectedKeys = Object.keys(spec.properties);
+      } else {
+        const dynamicTools = this.loadDynamicTools();
+        if (dynamicTools[name] && dynamicTools[name].properties) {
+          expectedKeys = Object.keys(dynamicTools[name].properties);
+        } else {
+          expectedKeys = this.requiredToolArgs[name] || [];
+        }
+      }
+    }
+
+    // 2. Build clean key lookup map (strips non-alphanumeric, lowercases)
+    const cleanKey = (k: string) => k.replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
+    const cleanExpectedMap: Record<string, string> = {};
+    for (const key of expectedKeys) {
+      cleanExpectedMap[cleanKey(key)] = key;
+    }
+
+    const manual = this.manualAliases[name];
+    const normalized: Record<string, any> = {};
+
+    for (const [key, val] of Object.entries(rawArgs)) {
+      const lowerKey = key.toLowerCase();
+      const stripped = lowerKey.replace(/[^a-z0-9]/g, '_').replace(/_+/g, '_').replace(/^_|_$/g, '');
+      let targetKey = key;
+
+      // Pass 1 – exact manual alias (handles both single-word and compound-word aliases)
+      if (manual && manual[stripped]) {
+        targetKey = manual[stripped];
+      } else if (manual && manual[lowerKey]) {
+        targetKey = manual[lowerKey];
+      } else {
+        // Pass 2 – exact clean match (camelCase / PascalCase collapse)
+        const cleaned = cleanKey(key);
+        if (cleanExpectedMap[cleaned]) {
+          targetKey = cleanExpectedMap[cleaned];
+        } else {
+          // Pass 3 – word-segment role matching (for edit_file and patch_file_lines)
+          // Split on underscores/camelCase boundaries and inspect the leading segment.
+          const segments = stripped.split('_').filter(Boolean);
+          if (segments.length >= 1) {
+            const leadWord = segments[0];
+            if ((name === 'edit_file' || name === 'run_speculative_patch') &&
+                !cleanExpectedMap[cleaned]) {
+              if (this.EDIT_FILE_TARGET_WORDS.has(leadWord)) {
+                targetKey = 'target_content';
+              } else if (this.EDIT_FILE_REPLACEMENT_WORDS.has(leadWord)) {
+                targetKey = 'replacement_content';
+              } else if (leadWord === 'file' || leadWord === 'path') {
+                targetKey = 'file_path';
+              }
+            } else if (name === 'patch_file_lines') {
+              if (this.EDIT_FILE_REPLACEMENT_WORDS.has(leadWord)) {
+                targetKey = 'replacement_content';
+              } else if (leadWord === 'start' || leadWord === 'from') {
+                targetKey = 'start_line';
+              } else if (leadWord === 'end' || leadWord === 'to') {
+                targetKey = 'end_line';
+              } else if (leadWord === 'file' || leadWord === 'path') {
+                targetKey = 'file_path';
+              }
+            }
+          }
+        }
+      }
+
+      normalized[targetKey] = val;
+    }
+
+    // Pass 4 – General robust heuristic mappings based on expected keys
+    for (const key of expectedKeys) {
+      if (key === 'path' && !normalized['path']) {
+        const val = normalized['file_path'] ?? normalized['filepath'] ?? normalized['file'];
+        if (val !== undefined) {
+          normalized['path'] = val;
+          delete normalized['file_path'];
+          delete normalized['filepath'];
+          delete normalized['file'];
+        }
+      }
+      if (key === 'file_path' && !normalized['file_path']) {
+        const val = normalized['path'] ?? normalized['filepath'] ?? normalized['file'];
+        if (val !== undefined) {
+          normalized['file_path'] = val;
+          delete normalized['path'];
+          delete normalized['filepath'];
+          delete normalized['file'];
+        }
+      }
+      if (key === 'content' && !normalized['content']) {
+        const val = normalized['text'] ?? normalized['code'] ?? normalized['file_content'] ?? normalized['filecontent'];
+        if (val !== undefined) {
+          normalized['content'] = val;
+          delete normalized['text'];
+          delete normalized['code'];
+          delete normalized['file_content'];
+          delete normalized['filecontent'];
+        }
+      }
+      if (key === 'replacement_content' && !normalized['replacement_content']) {
+        const val = normalized['content'] ?? normalized['text'] ?? normalized['code'] ?? normalized['replacement'] ?? normalized['replace'];
+        if (val !== undefined) {
+          if (!cleanExpectedMap['content']) {
+            normalized['replacement_content'] = val;
+            delete normalized['content'];
+            delete normalized['text'];
+            delete normalized['code'];
+            delete normalized['replacement'];
+            delete normalized['replace'];
+          }
+        }
+      }
+      if (key === 'target_content' && !normalized['target_content']) {
+        const val = normalized['target'] ?? normalized['original'] ?? normalized['old'] ?? normalized['find'] ?? normalized['search'];
+        if (val !== undefined) {
+          normalized['target_content'] = val;
+          delete normalized['target'];
+          delete normalized['original'];
+          delete normalized['old'];
+          delete normalized['find'];
+          delete normalized['search'];
+        }
+      }
+    }
+
+    // Post-pass normalizations/fallbacks for built-in tools
+    if (name === 'edit_file' || name === 'run_speculative_patch') {
+      if (normalized.replacement_content === undefined && normalized.content !== undefined) {
+        normalized.replacement_content = normalized.content;
+        delete normalized.content;
+      }
+      if (normalized.target_content === undefined && normalized.replacement_content !== undefined && normalized.file_path) {
+        try {
+          const resolved = this.resolveWorkspacePath(String(normalized.file_path));
+          if (resolved.ok && fs.existsSync(resolved.absolutePath)) {
+            const fileContent = fs.readFileSync(resolved.absolutePath, 'utf8');
+            normalized.target_content = fileContent;
+          } else if (name === 'edit_file') {
+            normalized.target_content = '';
+          }
+        } catch (e) {
+          if (name === 'edit_file') {
+            normalized.target_content = '';
+          }
+        }
+      }
+    } else if (name === 'patch_file_lines') {
+      if (normalized.replacement_content === undefined && normalized.content !== undefined) {
+        normalized.replacement_content = normalized.content;
+        delete normalized.content;
+      }
+    }
+
+    if (isMcp) {
+      const parts = name.split('__');
+      if (parts.length >= 3) {
+        const serverName = parts[1];
+        const toolName = parts.slice(2).join('__');
+        const mcpTools = MCPManager.getAllTools();
+        const matchedMcp = mcpTools.find(t => t.serverName.toLowerCase() === serverName.toLowerCase() && t.name.toLowerCase() === toolName.toLowerCase());
+        if (matchedMcp && matchedMcp.inputSchema && matchedMcp.inputSchema.properties) {
+          for (const key of Object.keys(matchedMcp.inputSchema.properties)) {
+            const prop = matchedMcp.inputSchema.properties[key];
+            if (prop && prop.type) {
+              const val = normalized[key];
+              if (val !== undefined && typeof val === 'string') {
+                if (prop.type === 'number' || prop.type === 'integer') {
+                  const num = Number(val);
+                  if (!isNaN(num)) {
+                    normalized[key] = num;
+                  }
+                } else if (prop.type === 'boolean') {
+                  if (val.toLowerCase() === 'true') normalized[key] = true;
+                  if (val.toLowerCase() === 'false') normalized[key] = false;
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    return normalized;
+  }
+
+  private static repairEditFileFullRewriteArgs(args: Record<string, any>): Record<string, any> {
+    if (args.target_content !== undefined || args.replacement_content === undefined || !args.file_path) {
+      return args;
+    }
+
+    try {
+      const resolved = this.resolveWorkspacePath(String(args.file_path));
+      if (resolved.ok && fs.existsSync(resolved.absolutePath)) {
+        args.target_content = fs.readFileSync(resolved.absolutePath, 'utf8');
+      } else {
+        // Missing file + missing target means the model is trying to create or
+        // overwrite a whole file with edit_file. Let editFile route this to
+        // writeFile instead of failing validation and entering a retry loop.
+        args.target_content = '';
+      }
+    } catch {
+      args.target_content = '';
+    }
+
+    return args;
+  }
 
   private static readonly toolSpecs: Record<string, ToolSchemaSpec> = {
     list_dir: {
@@ -330,14 +812,34 @@ export class ToolManager {
         token_id: { type: 'string', description: 'The 36-character UUID token ID of the webhook.' },
       },
     },
-    patch_file_lines: {
-      description: 'Replace a specific line range (from start_line to end_line, inclusive) in a workspace file with new content. This is extremely useful for fixing compiler/linter errors at precise line numbers.',
-      required: ['file_path', 'start_line', 'end_line', 'replacement_content'],
+    // The previously-named "patch_file_lines", "insert_file_lines",
+    // "replace_in_files", "run_speculative_patch", and
+    // "run_speculative_workspace_patch" tools were collapsed into
+    // "edit_file" + "write_file" to stop the model from picking between
+    // 7 overlapping file-modification tools. The model only sees
+    // read_file, write_file, and edit_file in its native tool schema now.
+    // The legacy names are still accepted in `execute()` for backward
+    // compatibility (see `LEGACY_TOOL_ALIASES` below) and are routed to
+    // the canonical tools.
+    get_file_metadata: {
+      description: 'Retrieve lightweight metadata (size, line count, modified time) for a file or directory without loading its full content.',
+      required: ['file_path'],
+      properties: {
+        file_path: { type: 'string', description: 'Workspace-relative or absolute file/directory path.' },
+      },
+    },
+    create_directory: {
+      description: 'Create a directory and any parent folders recursively in the workspace.',
+      required: ['directory_path'],
+      properties: {
+        directory_path: { type: 'string', description: 'Workspace-relative directory path to create.' },
+      },
+    },
+    git_diff_file: {
+      description: 'Retrieve the current uncommitted git changes for a single file.',
+      required: ['file_path'],
       properties: {
         file_path: { type: 'string', description: 'Workspace-relative or absolute file path.' },
-        start_line: { type: 'string', description: '1-indexed start line number (inclusive).' },
-        end_line: { type: 'string', description: '1-indexed end line number (inclusive).' },
-        replacement_content: { type: 'string', description: 'The new replacement content for this range.' },
       },
     },
     insert_file_lines: {
@@ -583,9 +1085,6 @@ export class ToolManager {
       additionalProperties: false,
     };
 
-    // New helper tool: find_learning_rules
-    this['find_learning_rules'] = [];
-
     if (format === 'anthropic') {
       return {
         name,
@@ -604,6 +1103,59 @@ export class ToolManager {
     };
   }
 
+  /**
+   * Best-effort recovery for a truncated JSON object string. Streaming
+   * `tool_calls` deltas from OpenAI / Gemini / proxies often arrive mid-token
+   * (e.g. `{"file_path":"src/`, `a.ts","replacement_content":"x`). When the
+   * stream ends before the final `}` we get a `SyntaxError` from `JSON.parse`.
+   *
+   * Strategy: walk the string and keep a stack of unclosed `{` and `[`. When
+   * the parse fails, drop any trailing partial token (string, number, `true`,
+   * `false`, `null`, identifier), close every still-open bracket, and try
+   * again. Returns the recovered object on success, or `null` if recovery is
+   * impossible.
+   *
+   * This is intentionally conservative — we only recover when the result is a
+   * plain object. We never invent fields.
+   */
+  private static recoverPartialJsonArgs(raw: string): Record<string, any> | null {
+    const tryParse = (s: string): any => {
+      try { return JSON.parse(s); } catch { return null; }
+    };
+
+    // Quick wins: trim trailing comma or colon and close.
+    let candidate = raw.replace(/[,\s:]+$/, '');
+    // Strip a trailing partial value: "string-no-close, number-no-close, true/false/null, identifier"
+    candidate = candidate.replace(
+      /(?:"[^"\\]*(?:\\.[^"\\]*)*"|-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?|\btrue\b|\bfalse\b|\bnull\b|\b[A-Za-z_][A-Za-z0-9_]*\b)\s*$/,
+      ''
+    );
+    // Close open brackets.
+    const openCounts: Record<string, number> = { '{': 0, '[': 0 };
+    let inString = false;
+    let escape = false;
+    for (let i = 0; i < candidate.length; i++) {
+      const ch = candidate[i];
+      if (inString) {
+        if (escape) { escape = false; continue; }
+        if (ch === '\\') { escape = true; continue; }
+        if (ch === '"') { inString = false; }
+        continue;
+      }
+      if (ch === '"') { inString = true; continue; }
+      if (ch === '{') openCounts['{']++;
+      else if (ch === '}') openCounts['{']--;
+      else if (ch === '[') openCounts['[']++;
+      else if (ch === ']') openCounts['[']--;
+    }
+    candidate = candidate + ']'.repeat(Math.max(0, openCounts['['])) + '}'.repeat(Math.max(0, openCounts['{']));
+    const parsed = tryParse(candidate);
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      return parsed as Record<string, any>;
+    }
+    return null;
+  }
+
   public static normalizeNativeToolCalls(rawToolCalls: any[] | undefined): ToolCall[] {
     if (!rawToolCalls || rawToolCalls.length === 0) return [];
 
@@ -614,24 +1166,96 @@ export class ToolManager {
 
       let args = call?.arguments ?? call?.input ?? call?.function?.arguments ?? {};
       if (typeof args === 'string') {
-        try {
-          args = args.trim() ? JSON.parse(args) : {};
-        } catch {
+        const trimmed = args.trim();
+        if (!trimmed) {
           args = {};
+        } else {
+          try {
+            args = JSON.parse(trimmed);
+          } catch {
+            // Streaming fragments often arrive mid-JSON (e.g. `{"file_path":"src/`,
+            // then `a.ts"}`). Try a recovery pass: trim the last partial
+            // value (string, number, identifier) and close any open braces
+            // and brackets, then re-parse.
+            const recovered = ToolManager.recoverPartialJsonArgs(trimmed);
+            if (recovered !== null) {
+              args = recovered;
+            } else {
+              args = {};
+            }
+          }
         }
       }
       if (!args || typeof args !== 'object' || Array.isArray(args)) {
         args = {};
       }
 
+      const normalizedArgs = this.normalizeToolArguments(name, args);
       const stringArgs: Record<string, any> = {};
-      for (const [key, value] of Object.entries(args)) {
-        stringArgs[key] = typeof value === 'string' ? value : JSON.stringify(value);
+      for (const [key, value] of Object.entries(normalizedArgs)) {
+        if (value && typeof value === 'object') {
+          stringArgs[key] = value;
+        } else {
+          stringArgs[key] = typeof value === 'string' ? value : String(value);
+        }
       }
       normalized.push({ name, arguments: stringArgs });
     }
 
     return normalized;
+  }
+
+  /**
+   * Resolves a raw tool name (potentially hallucinated or with incorrect prefixes)
+   * to its canonical form (either a built-in tool or an MCP tool).
+   * Returns the canonical tool name, or null if no match is found.
+   */
+  public static resolveToolName(name: string): string | null {
+    if (!name) return null;
+    const trimmed = name.trim();
+    const knownTools = new Set([
+      ...Object.keys(this.requiredToolArgs),
+      ...Object.keys(this.toolSpecs || {}),
+    ]);
+    const dynamicTools = this.loadDynamicTools();
+
+    // 1. Direct match (built-in or dynamic)
+    if (knownTools.has(trimmed) || dynamicTools[trimmed]) {
+      return trimmed;
+    }
+
+    // 2. Direct match with mcp__ prefix
+    if (trimmed.startsWith('mcp__')) {
+      return trimmed;
+    }
+
+    // 3. Cleaned matching logic for MCP tools
+    const cleanName = (n: string) => n.toLowerCase().replace(/[^a-z0-9]/g, '');
+    const targetClean = cleanName(trimmed);
+    const strippedTarget = targetClean.startsWith('mcp') ? targetClean.substring(3) : targetClean;
+
+    const allMcpTools = MCPManager.getAllTools();
+    const matchedMcp = allMcpTools.find(tool => {
+      const cleanToolName = cleanName(tool.name);
+      const cleanFullToolName = cleanName(tool.serverName + tool.name);
+      return cleanToolName === targetClean ||
+             cleanFullToolName === targetClean ||
+             cleanToolName === strippedTarget ||
+             cleanFullToolName === strippedTarget;
+    });
+
+    if (matchedMcp) {
+      return `mcp__${matchedMcp.serverName}__${matchedMcp.name}`;
+    }
+
+    // 4. Fuzzy matching for built-in tools (case-insensitive, alphanumeric-only check)
+    for (const kt of knownTools) {
+      if (cleanName(kt) === targetClean) {
+        return kt;
+      }
+    }
+
+    return null;
   }
 
   /**
@@ -676,9 +1300,16 @@ export class ToolManager {
       /<reasoning>[\s\S]*?<\/reasoning>/gi,
       /<reasoning_summary>[\s\S]*?<\/reasoning_summary>/gi,
       /:::reasoning[\s\S]*?(?:\n:::|:::)/gi,
+      /<\|python_tag\|>/gi,
+      /<\|tool_call\|>/gi,
     ];
     let cleaned = text;
     for (const p of patterns) cleaned = cleaned.replace(p, '');
+
+    // Replace <tool_call> (without attributes) and its matching </tool_call> if it wraps JSON
+    cleaned = cleaned.replace(/<tool_call\s*>\s*([\s\S]*?)\s*<\/tool_call>/gi, '$1');
+    cleaned = cleaned.replace(/<tool_call\s*>/gi, ''); // Fallback for unclosed tag
+
     // Unclosed leading <think> / <reasoning> block: only strip if it never
     // closes anywhere in the text. This is a best-effort defensive pass.
     const m = cleaned.match(/^\s*<(?:think|reasoning)>[\s\S]+$/i);
@@ -701,7 +1332,7 @@ export class ToolManager {
    * the two failure modes most often produced by LLMs.
    */
   private static parseJsonToolCalls(text: string): ToolCall[] {
-    const calls: ToolCall[] = [];
+    ToolManager.lastParserError = null;
 
     // 1a. Pull JSON out of ```json ... ``` fences if present.
     const fencedRegex = /```(?:json)?\s*([\s\S]*?)```/gi;
@@ -718,17 +1349,64 @@ export class ToolManager {
     const balanced = this.extractBalancedJsonFragments(text);
 
     const candidates = [...fencedBlocks, ...balanced];
+    
+    const isKnownTool = (name: string) => this.resolveToolName(name) !== null;
+
+    const scoredCandidates: Array<{
+      normalized: ToolCall[];
+      score: number;
+      isArray: boolean;
+    }> = [];
+
+    let syntaxError: string | null = null;
+    let hasJsonCandidate = false;
+
     for (const raw of candidates) {
-      const parsed = this.tryParseJson(raw);
-      if (!parsed) continue;
-      const normalized = this.normalizeJsonToolCalls(parsed);
-      if (normalized.length > 0) {
-        calls.push(...normalized);
-        if (!Array.isArray(parsed)) break;
+      const trimmed = raw.trim();
+      if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+        hasJsonCandidate = true;
       }
+      const { parsed, error } = this.tryParseJson(raw);
+      if (!parsed) {
+        if (error) {
+          syntaxError = `JSON syntax error in candidate:\n\`\`\`json\n${raw}\n\`\`\`\nError details: ${error}`;
+        }
+        continue;
+      }
+      const normalized = this.normalizeJsonToolCalls(parsed);
+      if (normalized.length === 0) {
+        syntaxError = `Parsed JSON successfully, but it did not match the expected tool call schema (missing "name" or "arguments" keys):\n\`\`\`json\n${JSON.stringify(parsed, null, 2)}\n\`\`\``;
+        continue;
+      }
+
+      // Calculate score for the candidate
+      let score = 0;
+      for (const call of normalized) {
+        if (isKnownTool(call.name)) {
+          score += 10;
+        } else {
+          score += 1;
+        }
+      }
+
+      scoredCandidates.push({
+        normalized,
+        score,
+        isArray: Array.isArray(parsed)
+      });
     }
 
-    return calls;
+    if (scoredCandidates.length === 0) {
+      if (hasJsonCandidate && syntaxError) {
+        ToolManager.lastParserError = syntaxError;
+      }
+      return [];
+    }
+
+    // Sort by score descending
+    scoredCandidates.sort((a, b) => b.score - a.score);
+
+    return scoredCandidates[0].normalized;
   }
 
   /**
@@ -776,26 +1454,35 @@ export class ToolManager {
 
   /**
    * Lenient JSON parse: falls back to stripping trailing commas and
-   * wrapping unquoted property names. Returns null if still invalid.
+   * wrapping unquoted property names. Returns { parsed, error }.
    */
-  private static tryParseJson(raw: string): any | null {
+  private static tryParseJson(raw: string): { parsed: any | null; error?: string } {
+    let lastErr: string | undefined;
     const tryParse = (input: string): any | null => {
-      try { return JSON.parse(input); } catch { return null; }
+      try {
+        return JSON.parse(input);
+      } catch (e: any) {
+        lastErr = e.message;
+        return null;
+      }
     };
     const direct = tryParse(raw);
-    if (direct !== null) return direct;
+    if (direct !== null) return { parsed: direct };
 
     // Strip trailing commas before ] or }
     const noTrailing = raw.replace(/,(\s*[}\]])/g, '$1');
     const relaxed = tryParse(noTrailing);
-    if (relaxed !== null) return relaxed;
+    if (relaxed !== null) return { parsed: relaxed };
 
     // Quote unquoted keys: { name: "x", args: {...} }
     const quotedKeys = noTrailing.replace(
       /([\{,\s])([A-Za-z_][A-Za-z0-9_-]*)\s*:/g,
       '$1"$2":',
     );
-    return tryParse(quotedKeys);
+    const quoted = tryParse(quotedKeys);
+    if (quoted !== null) return { parsed: quoted };
+
+    return { parsed: null, error: lastErr };
   }
 
   /**
@@ -812,16 +1499,29 @@ export class ToolManager {
   private static normalizeJsonToolCalls(value: any): ToolCall[] {
     const fromOne = (v: any): ToolCall | null => {
       if (!v || typeof v !== 'object') return null;
-      const name = typeof v.name === 'string' ? v.name.trim() : '';
-      if (!name) return null;
-      const raw = v.arguments ?? v.args ?? v.parameters ?? {};
-      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+      const rawName = typeof v.name === 'string' ? v.name.trim() : '';
+      if (!rawName) return null;
+
+      const resolved = this.resolveToolName(rawName);
+      if (!resolved) return null;
+
+      let raw = v.arguments ?? v.args ?? v.parameters;
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+        const rootArgs: Record<string, any> = {};
+        for (const [k, val] of Object.entries(v)) {
+          if (k !== 'name' && k !== 'arguments' && k !== 'args' && k !== 'parameters') {
+            rootArgs[k] = val;
+          }
+        }
+        raw = rootArgs;
+      }
+      const normalizedArgs = this.normalizeToolArguments(resolved, raw);
       const args: Record<string, any> = {};
-      for (const [k, val] of Object.entries(raw)) {
+      for (const [k, val] of Object.entries(normalizedArgs)) {
         if (val === undefined || val === null) continue;
         args[k] = val;
       }
-      return { name, arguments: args };
+      return { name: resolved, arguments: args };
     };
 
     if (Array.isArray(value)) {
@@ -868,9 +1568,12 @@ export class ToolManager {
     let match: RegExpExecArray | null;
     while ((match = toolCallRegex.exec(text)) !== null) {
       const name = match[1].trim();
+      const resolved = this.resolveToolName(name);
+      if (!resolved) continue;
       const innerContent = match[2];
       const args = parseParams(innerContent);
-      toolCalls.push({ name, arguments: args });
+      const normalizedArgs = this.normalizeToolArguments(resolved, args);
+      toolCalls.push({ name: resolved, arguments: normalizedArgs });
       processedIndices.add(match.index);
     }
 
@@ -892,9 +1595,12 @@ export class ToolManager {
       if (alreadyProcessed) continue;
 
       const name = directMatch[1].trim();
+      const resolved = this.resolveToolName(name);
+      if (!resolved) continue;
       const innerContent = directMatch[2];
       const args = parseParams(innerContent);
-      toolCalls.push({ name, arguments: args });
+      const normalizedArgs = this.normalizeToolArguments(resolved, args);
+      toolCalls.push({ name: resolved, arguments: normalizedArgs });
     }
 
     // 3. Fallback: Robust DeepSeek raw text line parser
@@ -976,39 +1682,142 @@ export class ToolManager {
     }
 
     for (const key of required) {
-      const allowsEmpty = key === 'content' || key === 'replacement_content' || key === 'html_content';
+      // Allow content/replacement_content/html_content/target_content to be empty
+      // strings – some edits intentionally replace with '' or search for a blank line.
+      const allowsEmpty = key === 'content' || key === 'replacement_content' ||
+                          key === 'html_content' || key === 'target_content';
       if (
         args[key] === undefined ||
         args[key] === null ||
         (!allowsEmpty && String(args[key]).trim() === '')
       ) {
-        return `Error: Tool "${name}" requires argument "${key}"`;
+        const receivedKeys = Object.keys(args).join(', ') || '(none)';
+        console.warn(
+          `[K-Horizon] validateToolCall: "${name}" missing required arg "${key}".`,
+          `Received keys: [${receivedKeys}]`,
+          `Received args:`, args
+        );
+        return `Error: Tool "${name}" requires argument "${key}" (received keys: ${receivedKeys})`;
       }
     }
 
     return null;
   }
 
+  /**
+   * Known-safe base commands for the allowlist advisory.
+   * Commands not matching any prefix in this list trigger a soft warning
+   * but are NOT blocked — the agent can still proceed.
+   */
+  private static readonly KNOWN_SAFE_COMMANDS = new Set([
+    'npm', 'npx', 'pnpm', 'yarn', 'node',
+    'git',
+    'tsc', 'webpack', 'vitest', 'jest', 'mocha', 'eslint', 'prettier',
+    'pwsh', 'powershell', 'cmd', 'dir', 'echo', 'type', 'cat', 'findstr',
+    'ls', 'pwd', 'mkdir', 'copy', 'move', 'ren', 'attrib',
+    'node-gyp', 'ng', 'nx', 'turbo',
+    'python', 'python3', 'pip', 'pip3',
+    'dotnet', 'cargo', 'go', 'rustc', 'gcc', 'clang', 'cmake',
+    'code', 'code-insiders',
+    '7z', 'tar', 'unzip', 'gzip',
+  ]);
+
   private static isDangerousCommand(command: string): string | null {
     const normalized = command.replace(/\s+/g, ' ').trim().toLowerCase();
     const blockedPatterns = [
+      // Destructive filesystem
       /\brm\s+(-[a-z]*r[a-z]*f|-rf|-fr)\s+(\/|\*|~|\.\.)/,
       /\bremove-item\b.*\b-recurse\b.*\b-force\b/i,
       /\brmdir\s+\/s\b/i,
       /\bdel\s+\/[a-z]*s[a-z]*\b/i,
+      /\bformat\s+[a-z]:/i,
+      /\bmkfs\b/,
+      // Destructive git
       /\bgit\s+reset\s+--hard\b/,
       /\bgit\s+clean\s+-[a-z]*f[a-z]*d/,
-      /\bformat\s+[a-z]:/i,
+      // System-level
       /\bshutdown\b/,
       /\breboot\b/,
-      /\bmkfs\b/,
+      /\bhalt\b/,
+      /\bpoweroff\b/,
+      // Registry (Windows)
+      /\breg\s+(add|delete)\b/i,
+      /\bregedit\b/i,
+      // Network exfiltration / download
+      /\bcurl\s+(-o|--output|-O|--remote-name)\s+/,
+      /\bwget\s+(-O|--output-document|-P|--directory-prefix)\s+/,
+      /\binvoke-webrequest\b.*\b-outfile\b/i,
+      /\biwr\b.*\b-outfile\b/i,
+      // Arbitrary code execution
+      /\binvoke-expression\b/i,
+      /\biex\b/i,
+      // Disk / partition manipulation
+      /\bdiskpart\b/i,
+      /\bfdisk\b/i,
+      /\bmount\s+/i,
+      /\bumount\b/i,
+      // Environment / credential exfil
+      /\bget-childitem\s+env:/i,
+      /\bprintenv\s+/i,
     ];
 
     if (blockedPatterns.some((pattern) => pattern.test(normalized))) {
-      return 'Error: Refusing to run a high-risk destructive command. Ask the user for an explicit manual action instead.';
+      return 'Error: Refusing to run a high-risk destructive command. This action has been blocked for safety. Ask the user for an explicit manual action instead.';
     }
 
     return null;
+  }
+
+  /**
+   * Soft advisory: warns if the base command is not in the known-safe list,
+   * but does NOT block execution. The agent can still proceed.
+   */
+  private static warnIfUnusualCommand(command: string): string | null {
+    const firstToken = command.trim().split(/\s+/)[0]?.toLowerCase();
+    if (!firstToken) return null;
+    // Strip any path prefix (e.g. "./node_modules/.bin/eslint" → "eslint")
+    const baseCommand = path.basename(firstToken);
+    if (this.KNOWN_SAFE_COMMANDS.has(baseCommand)) return null;
+    // Allow relative paths and absolute paths to known tools
+    if (baseCommand.endsWith('.exe') || baseCommand.endsWith('.bat') || baseCommand.endsWith('.ps1')) {
+      return null;
+    }
+    return `[SECURITY ADVISORY] The command "${command}" starts with "${baseCommand}" which is not in the known-safe command list. Verify this is intentional.`;
+  }
+
+  private static validatePackageInstallCommand(command: string): string | null {
+    const npmInstallMatch = command.match(/^\s*(?:npm\s+(?:install|i|in|ins|inst|insta|instal)|yarn\s+add|pnpm\s+add)\s+(.+)$/i);
+    if (npmInstallMatch) {
+      const targets = npmInstallMatch[1].split(/\s+/);
+      for (const target of targets) {
+        if (target.startsWith('-')) continue;
+        if (target.startsWith('.') || target.startsWith('/') || target.startsWith('\\') || /^[A-Za-z]:[\\\/]/.test(target) || (!target.startsWith('@') && (target.includes('/') || target.includes('\\')))) {
+          return `Error: Cannot install a local path or relative directory "${target}" as an npm package. If this is a local component or module, verify that the file exists and update the import statements in your code instead.`;
+        }
+      }
+    }
+    
+    const pipInstallMatch = command.match(/^\s*(?:pip\s+install|pip3\s+install)\s+(.+)$/i);
+    if (pipInstallMatch) {
+      const targets = pipInstallMatch[1].split(/\s+/);
+      for (const target of targets) {
+        if (target.startsWith('-')) continue;
+        if (target.startsWith('.') || target.startsWith('/') || target.startsWith('\\') || /^[A-Za-z]:[\\\/]/.test(target) || target.includes('/') || target.includes('\\')) {
+          return `Error: Cannot install a local path or relative directory "${target}" as a python package.`;
+        }
+      }
+    }
+    return null;
+  }
+
+  public static commandExists(cmd: string): boolean {
+    try {
+      const checkCmd = process.platform === 'win32' ? `where ${cmd}` : `which ${cmd}`;
+      execSync(checkCmd, { stdio: 'ignore' });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -1016,10 +1825,53 @@ export class ToolManager {
    */
   public static async execute(name: string, rawArgs: Record<string, any>): Promise<string> {
     try {
-      const isMcp = name.startsWith('mcp__');
+      let resolvedName = name;
+      let isMcp = resolvedName.startsWith('mcp__');
+
+      if (!isMcp) {
+        const knownTools = new Set([
+          ...Object.keys(this.requiredToolArgs),
+          ...Object.keys(this.toolSpecs || {}),
+        ]);
+        const dynamicTools = this.loadDynamicTools();
+        const isBuiltinOrDynamic = knownTools.has(resolvedName) || !!dynamicTools[resolvedName];
+
+        if (!isBuiltinOrDynamic) {
+          // Look up in MCPManager to see if it is a tool exposed by an MCP server
+          const cleanName = (n: string) => n.toLowerCase().replace(/[^a-z0-9]/g, '');
+          const targetClean = cleanName(resolvedName);
+          const strippedTarget = targetClean.startsWith('mcp') ? targetClean.substring(3) : targetClean;
+
+          const allMcpTools = MCPManager.getAllTools();
+          const matchedMcp = allMcpTools.find(tool => {
+            const cleanToolName = cleanName(tool.name);
+            const cleanFullToolName = cleanName(tool.serverName + tool.name);
+            return cleanToolName === targetClean ||
+                   cleanFullToolName === targetClean ||
+                   cleanToolName === strippedTarget ||
+                   cleanFullToolName === strippedTarget;
+          });
+          if (matchedMcp) {
+            resolvedName = `mcp__${matchedMcp.serverName}__${matchedMcp.name}`;
+            isMcp = true;
+          }
+        }
+      }
+
+      // Diagnostic logging for file-editing tools to help trace argument name issues.
+      if (resolvedName === 'edit_file' || resolvedName === 'patch_file_lines' || resolvedName === 'run_speculative_patch') {
+        console.log(`[K-Horizon] execute("${resolvedName}") raw keys:`, Object.keys(rawArgs));
+      }
+
+      const normalizedArgs = this.normalizeToolArguments(resolvedName, rawArgs);
+
+      if (resolvedName === 'edit_file' || resolvedName === 'patch_file_lines' || resolvedName === 'run_speculative_patch') {
+        console.log(`[K-Horizon] execute("${resolvedName}") normalized keys:`, Object.keys(normalizedArgs));
+      }
+
       const args: Record<string, any> = {};
-      for (const key of Object.keys(rawArgs)) {
-        const val = rawArgs[key];
+      for (const key of Object.keys(normalizedArgs)) {
+        const val = normalizedArgs[key];
         if (val === undefined || val === null) continue;
         if (isMcp) {
           args[key] = val;
@@ -1028,19 +1880,24 @@ export class ToolManager {
         }
       }
 
-      const validationError = this.validateToolCall(name, args);
+      if (resolvedName === 'edit_file') {
+        this.repairEditFileFullRewriteArgs(args);
+      }
+
+      const validationError = this.validateToolCall(resolvedName, args);
       if (validationError) return validationError;
 
       if (isMcp) {
-        const parts = name.split('__');
+        const parts = resolvedName.split('__');
         if (parts.length >= 3) {
           const serverName = parts[1];
           const toolName = parts.slice(2).join('__');
+          const canonicalServerName = MCPManager.getCanonicalServerName(serverName);
 
           // Documentation MCP guardrail: only allow coding/dev-related queries
-          // Applies to Context7 and ProContext — both are library documentation servers
-          const DOC_SERVERS = ['Context7', 'ProContext'];
-          if (DOC_SERVERS.includes(serverName)) {
+          // Applies to Context7 — library documentation server
+          const DOC_SERVERS = ['Context7'];
+          if (DOC_SERVERS.some(ds => ds.toLowerCase() === serverName.toLowerCase())) {
             const queryVal = String(args.query || args.libraryName || '').toLowerCase();
             const DEV_KEYWORDS = [
               'api', 'sdk', 'library', 'framework', 'docs', 'documentation',
@@ -1078,11 +1935,11 @@ export class ToolManager {
             }
           }
 
-          return await MCPManager.callMcpTool(serverName, toolName, args);
+          return await MCPManager.callMcpTool(canonicalServerName, toolName, args);
         }
       }
 
-      switch (name) {
+      switch (resolvedName) {
         case 'list_dir':
           return await this.listDir(args.directory);
         case 'read_file':
@@ -1183,6 +2040,16 @@ export class ToolManager {
           );
         case 'update_dependency_graph':
           return await this.updateDependencyGraph();
+        case 'trace_symbol_dependency':
+          return await this.traceSymbolDependency(args.symbol_name, args.depth ? parseInt(args.depth) : undefined);
+        case 'replace_in_files':
+          return await this.replaceInFiles(args.query, args.replacement, args.includes);
+        case 'get_file_metadata':
+          return this.getFileMetadata(args.file_path);
+        case 'create_directory':
+          return this.createDirectory(args.directory_path);
+        case 'git_diff_file':
+          return await this.gitDiffFile(args.file_path);
         case 'request_hunk_reviews':
           return await this.requestHunkReviews(
             args.diffs_json
@@ -1215,10 +2082,10 @@ export class ToolManager {
           return await this.toggleAutocomplete(args.enabled);
         default:
           const dynamicTools = this.loadDynamicTools();
-          if (dynamicTools[name]) {
-            return await this.executeDynamicTool(name, args);
+          if (dynamicTools[resolvedName]) {
+            return await this.executeDynamicTool(resolvedName, args);
           }
-          return `Error: Unknown tool "${name}"`;
+          return `Error: Unknown tool "${resolvedName}"`;
       }
     } catch (e: any) {
       return `Error executing tool "${name}": ${e.message}`;
@@ -1330,6 +2197,9 @@ export class ToolManager {
     if (!resolved.ok) return resolved.error;
     const targetFile = resolved.absolutePath;
     if (!fs.existsSync(targetFile)) {
+      if (targetContent === '') {
+        return await this.writeFile(filePath, replacementContent);
+      }
       return `Error: File not found: ${filePath}`;
     }
 
@@ -1426,6 +2296,114 @@ export class ToolManager {
     return `Success: Edited file: ${vscode.workspace.asRelativePath(targetFile)} (${editResult.strategy} match)\n\n[DIFF]\n${diffLines.join('\n')}\n\n[DIFF_PATHS]\n${tempOriginalPath}|${targetFile}`;
   }
 
+  public static applyPlaceholderReplacement(
+    originalContent: string,
+    targetContent: string,
+    replacementContent: string
+  ): { content: string; strategy: string } | null {
+    const lines = targetContent.split(/\r?\n/);
+    const placeholderRegex = /^\s*(?:\/\/|\/\*|#|--|\*)*\s*\.\.\.\s*(?:\*\/)?\s*$/;
+    
+    const placeholderIndices: number[] = [];
+    lines.forEach((line, idx) => {
+      if (placeholderRegex.test(line)) {
+        placeholderIndices.push(idx);
+      }
+    });
+
+    if (placeholderIndices.length === 0) {
+      return null;
+    }
+
+    // Split targetContent into non-empty segments separated by placeholders
+    const segments: string[][] = [];
+    let currentSegment: string[] = [];
+    lines.forEach((line) => {
+      if (placeholderRegex.test(line)) {
+        if (currentSegment.length > 0) {
+          segments.push(currentSegment);
+          currentSegment = [];
+        }
+      } else {
+        currentSegment.push(line);
+      }
+    });
+    if (currentSegment.length > 0) {
+      segments.push(currentSegment);
+    }
+
+    // We need at least a prefix and a suffix segment to do a span replacement
+    if (segments.length < 2) {
+      return null;
+    }
+
+    const firstSegment = segments[0].join('\n');
+    const lastSegment = segments[segments.length - 1].join('\n');
+
+    // Find the positions of the first and last segments in the original content
+    const normalizedOriginal = originalContent.replace(/\r\n/g, '\n');
+    const normalizedFirst = firstSegment.replace(/\r\n/g, '\n');
+    const normalizedLast = lastSegment.replace(/\r\n/g, '\n');
+
+    const firstIndex = this.findSegmentMatchIndex(normalizedOriginal, normalizedFirst);
+    if (firstIndex === -1) return null;
+
+    const lastIndex = this.findSegmentMatchIndex(normalizedOriginal, normalizedLast, firstIndex + normalizedFirst.length);
+    if (lastIndex === -1) return null;
+
+    const eol = originalContent.includes('\r\n') ? '\r\n' : '\n';
+    const next = normalizedOriginal.slice(0, firstIndex)
+      + replacementContent.replace(/\r\n/g, '\n')
+      + normalizedOriginal.slice(lastIndex + normalizedLast.length);
+
+    return {
+      content: eol === '\r\n' ? next.replace(/\n/g, '\r\n') : next,
+      strategy: 'placeholder-span-replacement'
+    };
+  }
+
+  private static findSegmentMatchIndex(content: string, segment: string, startFrom = 0): number {
+    const idx = content.indexOf(segment, startFrom);
+    if (idx !== -1) return idx;
+
+    // Fallback: Line-whitespace-tolerant match
+    const contentLines = content.split('\n');
+    const segmentLines = segment.split('\n');
+    const normalizeLine = (line: string) => line.replace(/[ \t]+$/g, '').trimStart();
+    const normalizedSegmentLines = segmentLines.map(normalizeLine);
+
+    // Find startFrom line index
+    let startLineIdx = 0;
+    let charCount = 0;
+    for (let i = 0; i < contentLines.length; i++) {
+      if (charCount >= startFrom) {
+        startLineIdx = i;
+        break;
+      }
+      charCount += contentLines[i].length + 1; // +1 for newline
+    }
+
+    for (let start = startLineIdx; start <= contentLines.length - segmentLines.length; start++) {
+      let matches = true;
+      for (let offset = 0; offset < segmentLines.length; offset++) {
+        if (normalizeLine(contentLines[start + offset]) !== normalizedSegmentLines[offset]) {
+          matches = false;
+          break;
+        }
+      }
+      if (matches) {
+        // Calculate char index of this line match
+        let matchCharIdx = 0;
+        for (let i = 0; i < start; i++) {
+          matchCharIdx += contentLines[i].length + 1;
+        }
+        return matchCharIdx;
+      }
+    }
+
+    return -1;
+  }
+
   public static applyFlexibleReplacement(
     originalContent: string,
     targetContent: string,
@@ -1433,6 +2411,11 @@ export class ToolManager {
   ): { content: string; strategy: string } | null {
     if (targetContent === '') {
       return null;
+    }
+
+    const placeholderRes = this.applyPlaceholderReplacement(originalContent, targetContent, replacementContent);
+    if (placeholderRes) {
+      return placeholderRes;
     }
 
     // Support SEARCH/REPLACE blocks format in targetContent or replacementContent
@@ -2088,10 +3071,33 @@ export class ToolManager {
     const commandRisk = this.isDangerousCommand(command);
     if (commandRisk) return commandRisk;
 
+    const unusualWarning = this.warnIfUnusualCommand(command);
+    const advisoryPrefix = unusualWarning ? unusualWarning + '\n\n' : '';
+
+    const installLocalCheck = this.validatePackageInstallCommand(command);
+    if (installLocalCheck) return installLocalCheck;
+
     const workspaceRoot = getWorkspaceRoot();
     if (!workspaceRoot) {
       return 'Error: No workspace folder open to run commands';
     }
+
+    const formatPreflightFailure = (
+      message: string,
+      category: string,
+      remediation?: string
+    ): string => {
+      let result = `[EXIT_CODE: null]\n`;
+      result += `[SIGNAL: null]\n`;
+      result += `[FAILED: true]\n`;
+      result += `[CATEGORY: ${category}]\n\n`;
+      result += `[COMMAND FAILED] ${message}\n`;
+      if (remediation) {
+        result += `\n[REMEDIATION HINT] ${remediation}\n`;
+      }
+      result += `\n[ELAPSED TIME: 0ms]\n`;
+      return result;
+    };
 
     // Resolve directory if provided, otherwise fall back to the workspace root.
     let cwd = workspaceRoot;
@@ -2102,7 +3108,11 @@ export class ToolManager {
       if (fs.existsSync(targetDir) && fs.statSync(targetDir).isDirectory()) {
         cwd = targetDir;
       } else {
-        return `Error: Specified directory does not exist or is not a directory: ${directory}`;
+        return formatPreflightFailure(
+          `Specified directory does not exist or is not a directory: ${directory}`,
+          'enoent',
+          'Pass a directory path that exists inside the current workspace.'
+        );
       }
     }
 
@@ -2122,7 +3132,11 @@ export class ToolManager {
           cwd = pkgDir;
         }
         if (!fs.existsSync(path.join(cwd, 'package.json'))) {
-          return `Error: No package.json found in ${cwd} or any parent directory. Run \`npm init -y\` first to create one, then retry this command.`;
+          return formatPreflightFailure(
+            `No package.json found in ${cwd} or any parent directory.`,
+            'missing-package-json',
+            'Run `npm init -y` first to create one, or pass the correct directory containing package.json.'
+          );
         }
       }
     }
@@ -2131,7 +3145,8 @@ export class ToolManager {
     // 60-second timeout when the LLM hallucinates a script name).
     const preflight = inspectPlannedCommand(command, cwd);
     if (!preflight.ok) {
-      return `Error: ${preflight.reason}`;
+      const category = /does not define|script/i.test(preflight.reason) ? 'missing-script' : 'unknown';
+      return formatPreflightFailure(preflight.reason, category, preflight.reason);
     }
 
     const startTime = Date.now();
@@ -2151,18 +3166,27 @@ export class ToolManager {
     let isDocker = false;
 
     if (sandboxMode === 'Docker') {
+      if (!this.commandExists('docker')) {
+        return formatPreflightFailure(
+          'Docker is not installed or not available on your system PATH.',
+          'command-not-found',
+          'Install Docker, start Docker Desktop, or disable Docker sandbox mode in K-Horizon settings.'
+        );
+      }
       try {
         const tempScriptDir = path.join(workspaceRoot, '.k-horizon');
         if (!fs.existsSync(tempScriptDir)) {
           fs.mkdirSync(tempScriptDir, { recursive: true });
         }
         const scriptPath = path.join(tempScriptDir, 'sandbox_run.sh');
-        fs.writeFileSync(scriptPath, `set -e\n${command}`, 'utf8');
+        const normalizedCommand = command.replace(/\r\n/g, '\n');
+        fs.writeFileSync(scriptPath, `set -e\n${normalizedCommand}`, 'utf8');
 
         const relCwd = path.relative(workspaceRoot, cwd).replace(/\\/g, '/');
         const containerWd = relCwd ? `/workspace/${relCwd}` : '/workspace';
 
-        finalCommand = `docker run --rm -v "${workspaceRoot}:/workspace" -w "${containerWd}" node:18-alpine sh /workspace/.k-horizon/sandbox_run.sh`;
+        const userArg = (process.getuid && process.getgid) ? `--user ${process.getuid()}:${process.getgid()}` : '';
+        finalCommand = `docker run --rm ${userArg} -v "${workspaceRoot}:/workspace" -w "${containerWd}" node:18-alpine sh /workspace/.k-horizon/sandbox_run.sh`;
         isDocker = true;
       } catch (err: any) {
         isDocker = false;
@@ -2249,7 +3273,7 @@ export class ToolManager {
       };
 
       if (!isDocker) {
-        runLocalSequentially(subCommands).then(resolve);
+        runLocalSequentially(subCommands, advisoryPrefix || undefined).then(resolve);
         return;
       }
 
@@ -2363,7 +3387,18 @@ export class ToolManager {
       // Best effort — never let refresh failures block diagnostics output.
     }
 
-    const diagnostics = vscode.languages.getDiagnostics();
+    // Wait/poll diagnostics up to 900ms to allow the language server to settle
+    let diagnostics = vscode.languages.getDiagnostics();
+    let hasDiagnostics = diagnostics.some(([_, diags]) => diags.length > 0);
+    
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await new Promise(r => setTimeout(r, 300));
+      diagnostics = vscode.languages.getDiagnostics();
+      const currentHas = diagnostics.some(([_, diags]) => diags.length > 0);
+      if (currentHas !== hasDiagnostics) {
+        break; // diagnostics updated, stop waiting
+      }
+    }
     let result = '';
     for (const [uri, fileDiagnostics] of diagnostics) {
       if (filePath) {
@@ -2520,6 +3555,283 @@ export class ToolManager {
     }
   }
 
+  private static async traceSymbolDependency(symbolName?: string, depth = 2): Promise<string> {
+    if (!symbolName) return 'Error: symbol_name argument is required';
+
+    try {
+      // 1. Locate symbol definition using executeWorkspaceSymbolProvider
+      const symbols = await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
+        'vscode.executeWorkspaceSymbolProvider',
+        symbolName
+      );
+
+      if (!symbols || symbols.length === 0) {
+        return `Error: Could not find definition for symbol "${symbolName}" in workspace. Make sure language services are initialized.`;
+      }
+
+      // Filter for exact symbol name matches
+      const targetSymbol = symbols.find(sym => sym.name.toLowerCase() === symbolName.toLowerCase()) || symbols[0];
+      const targetUri = targetSymbol.location.uri;
+      const targetRange = targetSymbol.location.range;
+      const targetPos = targetRange.start;
+      const targetRelPath = vscode.workspace.asRelativePath(targetUri);
+
+      // We will trace relations: caller -> callee
+      const relations: Array<{ caller: string; callerFile: string; callee: string; calleeFile: string }> = [];
+      const visited = new Set<string>();
+
+      const traceQueue: Array<{ name: string; uri: vscode.Uri; pos: vscode.Position; currentDepth: number }> = [
+        { name: targetSymbol.name, uri: targetUri, pos: targetPos, currentDepth: 1 }
+      ];
+
+      while (traceQueue.length > 0) {
+        const current = traceQueue.shift()!;
+        if (current.currentDepth > depth) continue;
+
+        try {
+          const refs = await vscode.commands.executeCommand<vscode.Location[]>(
+            'vscode.executeReferenceProvider',
+            current.uri,
+            current.pos
+          );
+
+          if (refs && refs.length > 0) {
+            for (const ref of refs) {
+              const refRelPath = vscode.workspace.asRelativePath(ref.uri);
+              
+              // Skip if it's the definition itself
+              if (refRelPath === vscode.workspace.asRelativePath(current.uri) && 
+                  ref.range.start.line === current.pos.line) {
+                continue;
+              }
+
+              // Find enclosing container (method/function/class name) for the reference
+              let containerName = 'global_scope';
+              try {
+                const docSymbols = await vscode.commands.executeCommand<any[]>(
+                  'vscode.executeDocumentSymbolProvider',
+                  ref.uri
+                );
+                if (docSymbols && docSymbols.length > 0) {
+                  const found = this.findEnclosingSymbol(docSymbols, ref.range.start);
+                  if (found) {
+                    containerName = `${found.name} (${vscode.SymbolKind[found.kind] || 'Symbol'})`;
+                  }
+                }
+              } catch {}
+
+              const relationKey = `${refRelPath}:${containerName} -> ${current.name}`;
+              if (!visited.has(relationKey)) {
+                visited.add(relationKey);
+                relations.push({
+                  caller: containerName,
+                  callerFile: refRelPath,
+                  callee: current.name,
+                  calleeFile: vscode.workspace.asRelativePath(current.uri)
+                });
+
+                // If within depth, enqueue the caller to trace its callers
+                if (current.currentDepth < depth) {
+                  traceQueue.push({
+                    name: containerName,
+                    uri: ref.uri,
+                    pos: ref.range.start,
+                    currentDepth: current.currentDepth + 1
+                  });
+                }
+              }
+            }
+          }
+        } catch {}
+      }
+
+      // 2. Format output as a Mermaid diagram and lists
+      let output = `## Symbol Dependency Graph for: \`${symbolName}\`\n\n`;
+      output += `- **Definition Location:** \`${targetRelPath}:L${targetPos.line + 1}\`\n`;
+      output += `- **Symbol Type:** ${vscode.SymbolKind[targetSymbol.kind] || 'Unknown'}\n\n`;
+
+      if (relations.length === 0) {
+        output += `No incoming call references found for \`${symbolName}\` within depth limit ${depth}.\n`;
+        return output;
+      }
+
+      output += `### Mermaid Call Graph:\n\n\`\`\`mermaid\ngraph TD\n`;
+      output += `  %% Node Styles\n`;
+      output += `  classDef target fill:#4CAF50,stroke:#388E3C,stroke-width:2px,color:#fff;\n`;
+      output += `  classDef caller fill:#2196F3,stroke:#0b7dda,stroke-width:1px,color:#fff;\n\n`;
+
+      const nodeIds = new Map<string, string>();
+      let nodeIdCounter = 0;
+      const getOrCreateNodeId = (name: string, file: string) => {
+        const key = `${file}:${name}`;
+        if (!nodeIds.has(key)) {
+          const id = `node_${nodeIdCounter++}`;
+          nodeIds.set(key, id);
+          
+          const cleanLabel = `${name}\\n(${file})`;
+          output += `  ${id}["${cleanLabel}"]\n`;
+        }
+        return nodeIds.get(key)!;
+      };
+
+      // Add target symbol style
+      const targetNodeId = getOrCreateNodeId(targetSymbol.name, targetRelPath);
+      output += `  class ${targetNodeId} target;\n`;
+
+      // Build edges
+      for (const rel of relations) {
+        const callerId = getOrCreateNodeId(rel.caller, rel.callerFile);
+        const calleeId = getOrCreateNodeId(rel.callee, rel.calleeFile);
+        output += `  ${callerId} --> ${calleeId}\n`;
+        
+        if (calleeId === targetNodeId) {
+          output += `  class ${callerId} caller;\n`;
+        }
+      }
+
+      output += `\`\`\`\n\n`;
+      
+      output += `### Detailed Reference List:\n`;
+      relations.forEach((rel, index) => {
+        output += `${index + 1}. **Caller:** \`${rel.caller}\` in \`${rel.callerFile}\` calling \`${rel.callee}\` in \`${rel.calleeFile}\`\n`;
+      });
+
+      return output;
+    } catch (e: any) {
+      return `Error tracing symbol dependency: ${e.message}`;
+    }
+  }
+
+  private static findEnclosingSymbol(symbols: any[], position: vscode.Position): any | null {
+    let bestMatch: any | null = null;
+
+    const traverse = (symList: any[]) => {
+      for (const sym of symList) {
+        const range = sym.range || sym.location?.range;
+        if (range && range.start.line <= position.line && range.end.line >= position.line) {
+          if (!bestMatch) {
+            bestMatch = sym;
+          } else {
+            const bestRange = bestMatch.range || bestMatch.location?.range;
+            if (bestRange && (range.end.line - range.start.line) <= (bestRange.end.line - bestRange.start.line)) {
+              bestMatch = sym;
+            }
+          }
+          if (sym.children && sym.children.length > 0) {
+            traverse(sym.children);
+          }
+        }
+      }
+    };
+
+    traverse(symbols);
+    return bestMatch;
+  }
+
+  private static async replaceInFiles(query?: string, replacement?: string, includes?: string): Promise<string> {
+    if (!query || replacement === undefined) {
+      return 'Error: query and replacement arguments are required';
+    }
+    try {
+      const globPattern = includes || '**/*';
+      const uris = await vscode.workspace.findFiles(globPattern, '**/node_modules/**');
+      let matchCount = 0;
+      let fileCount = 0;
+
+      for (const uri of uris) {
+        const filePath = uri.fsPath;
+        const stat = fs.statSync(filePath);
+        if (!stat.isFile()) continue;
+
+        const content = fs.readFileSync(filePath, 'utf8');
+        if (content.includes(query)) {
+          const newContent = content.split(query).join(replacement);
+          fs.writeFileSync(filePath, newContent, 'utf8');
+          matchCount += content.split(query).length - 1;
+          fileCount++;
+        }
+      }
+      return `Success: Replaced "${query}" with "${replacement}" in ${fileCount} files (${matchCount} occurrences total).`;
+    } catch (e: any) {
+      return `Error replacing in files: ${e.message}`;
+    }
+  }
+
+  private static getFileMetadata(filePath?: string): string {
+    if (!filePath) return 'Error: file_path argument is required';
+    const resolved = this.resolveWorkspacePath(filePath);
+    if (!resolved.ok) return resolved.error;
+    const targetFile = resolved.absolutePath;
+
+    try {
+      if (!fs.existsSync(targetFile)) {
+        return `Error: File not found: ${filePath}`;
+      }
+      const stat = fs.statSync(targetFile);
+      const isDir = stat.isDirectory();
+      
+      let lineCount = 0;
+      if (!isDir) {
+        const content = fs.readFileSync(targetFile, 'utf8');
+        lineCount = content.split(/\r?\n/).length;
+      }
+
+      const metadata = {
+        path: vscode.workspace.asRelativePath(targetFile),
+        type: isDir ? 'directory' : 'file',
+        size_bytes: stat.size,
+        line_count: lineCount,
+        modified_time: new Date(stat.mtimeMs).toISOString(),
+        created_time: new Date(stat.birthtimeMs).toISOString(),
+        is_readonly: false
+      };
+
+      return JSON.stringify(metadata, null, 2);
+    } catch (e: any) {
+      return `Error fetching metadata: ${e.message}`;
+    }
+  }
+
+  private static createDirectory(directoryPath?: string): string {
+    if (!directoryPath) return 'Error: directory_path argument is required';
+    const resolved = this.resolveWorkspacePath(directoryPath);
+    if (!resolved.ok) return resolved.error;
+    const targetDir = resolved.absolutePath;
+
+    try {
+      if (fs.existsSync(targetDir)) {
+        return `Directory already exists: ${directoryPath}`;
+      }
+      fs.mkdirSync(targetDir, { recursive: true });
+      return `Success: Created directory at ${directoryPath}`;
+    } catch (e: any) {
+      return `Error creating directory: ${e.message}`;
+    }
+  }
+
+  private static async gitDiffFile(filePath?: string): Promise<string> {
+    if (!filePath) return 'Error: file_path argument is required';
+    const resolved = this.resolveWorkspacePath(filePath);
+    if (!resolved.ok) return resolved.error;
+    const targetFile = resolved.absolutePath;
+
+    if (!fs.existsSync(targetFile)) {
+      return `Error: File not found: ${filePath}`;
+    }
+
+    const workspaceRoot = getWorkspaceRoot();
+    try {
+      const relPath = path.relative(workspaceRoot, targetFile).replace(/\\/g, '/');
+      const diffOutput = await this.runCommand(`git diff -- "${relPath}"`, workspaceRoot);
+      if (!diffOutput || diffOutput.trim() === '' || diffOutput.includes('[COMMAND FAILED]')) {
+        return `No uncommitted changes in git for file: ${relPath}`;
+      }
+      return diffOutput;
+    } catch (e: any) {
+      return `Error getting git diff for file: ${e.message}`;
+    }
+  }
+
   private static async showInfoMessage(message?: string): Promise<string> {
     if (!message) return 'Error: message argument is missing';
     vscode.window.showInformationMessage(message);
@@ -2537,6 +3849,9 @@ export class ToolManager {
 
   private static async sendToTerminal(command?: string, terminalName = 'K-Horizon Terminal'): Promise<string> {
     if (!command) return 'Error: command argument is missing';
+    const installLocalCheck = this.validatePackageInstallCommand(command);
+    if (installLocalCheck) return installLocalCheck;
+    
     try {
       let terminal = vscode.window.terminals.find(t => t.name === terminalName);
       if (!terminal) {
@@ -3249,9 +4564,9 @@ export const supabase = createClient(supabaseUrl, supabaseKey);
       return `Error: Dynamic tool implementation file not found for "${name}"`;
     }
     try {
-      delete require.cache[require.resolve(jsPath)];
-      // eslint-disable-next-line @typescript-eslint/no-var-requires
-      const module = require(jsPath);
+      const req = eval('require');
+      delete req.cache[req.resolve(jsPath)];
+      const module = req(jsPath);
       if (typeof module.run !== 'function') {
         return `Error: Dynamic tool "${name}" does not export a "run(args)" function.`;
       }
@@ -3469,65 +4784,71 @@ export const supabase = createClient(supabaseUrl, supabaseKey);
       return `Error parsing patches_json: ${e.message}`;
     }
 
-    const workspaceRoot = getWorkspaceRoot();
-    const originalBranch = await this.runCommand('git branch --show-current');
-    const cleanBranchName = originalBranch.replace(/\[FAILED[\s\S]*$/, '').trim();
-
     const originalContents: Record<string, string> = {};
     for (const patch of patches) {
       const resolved = this.resolveWorkspacePath(patch.file_path);
       if (!resolved.ok) return resolved.error;
-      if (!fs.existsSync(resolved.absolutePath)) {
+      const fileAbs = resolved.absolutePath;
+      if (!fs.existsSync(fileAbs)) {
         return `Error: File not found: ${patch.file_path}`;
       }
-      originalContents[resolved.absolutePath] = fs.readFileSync(resolved.absolutePath, 'utf8');
+      originalContents[fileAbs] = fs.readFileSync(fileAbs, 'utf8');
     }
 
-    const stashRes = await this.runCommand('git stash --include-untracked');
-    const tempBranch = `speculative-${Date.now()}`;
-    const checkoutRes = await this.runCommand(`git checkout -b ${tempBranch}`);
-
+    const modifiedContents: Record<string, string> = {};
     for (const patch of patches) {
       const resolved = this.resolveWorkspacePath(patch.file_path);
-      if (!resolved.ok) {
-        await this.runCommand(`git checkout ${cleanBranchName}`);
-        await this.runCommand(`git branch -D ${tempBranch}`);
-        await this.runCommand('git stash pop');
-        return resolved.error;
-      }
-      const filePathAbs = resolved.absolutePath;
-      const currentContent = fs.readFileSync(filePathAbs, 'utf8');
+      if (!resolved.ok) return resolved.error;
+      const fileAbs = resolved.absolutePath;
+      
+      const currentContent = modifiedContents[fileAbs] !== undefined 
+        ? modifiedContents[fileAbs] 
+        : originalContents[fileAbs];
+        
       const editResult = this.applyFlexibleReplacement(currentContent, patch.target_content, patch.replacement_content);
       if (!editResult) {
-        await this.runCommand(`git checkout ${cleanBranchName}`);
-        await this.runCommand(`git branch -D ${tempBranch}`);
-        await this.runCommand('git stash pop');
+        // Restore any changes already written or held
         return `Error: Speculative patch failed for file: ${patch.file_path}. Target content not found.`;
       }
-      fs.writeFileSync(filePathAbs, editResult.content, 'utf8');
+      modifiedContents[fileAbs] = editResult.content;
     }
 
-    const validationOutput = await this.runCommand(validationCommand);
-    const failedFlagMatch = validationOutput.match(/\[FAILED:\s*(true|false)\]/);
-    const failed = failedFlagMatch 
-      ? failedFlagMatch[1] === 'true' 
-      : (validationOutput.includes('[COMMAND FAILED]') || validationOutput.includes('[COMMAND TIMEOUT]'));
-
-    if (failed) {
-      await this.runCommand(`git checkout ${cleanBranchName}`);
-      await this.runCommand(`git branch -D ${tempBranch}`);
-      await this.runCommand('git stash pop');
-      return `Speculative workspace patch validation failed. Reverted all changes.\nCommand output:\n${validationOutput}`;
+    // Write modified contents to disk
+    try {
+      for (const [fileAbs, content] of Object.entries(modifiedContents)) {
+        fs.writeFileSync(fileAbs, content, 'utf8');
+      }
+    } catch (e: any) {
+      // Revert disk writes on failure
+      for (const [fileAbs, content] of Object.entries(originalContents)) {
+        try { fs.writeFileSync(fileAbs, content, 'utf8'); } catch {}
+      }
+      return `Error writing speculative patches to disk: ${e.message}`;
     }
 
-    await this.runCommand('git add .');
-    await this.runCommand('git commit -m "speculative changes successful"');
-    await this.runCommand(`git checkout ${cleanBranchName}`);
-    const mergeRes = await this.runCommand(`git merge ${tempBranch} --no-ff -m "merge speculative branch"`);
-    await this.runCommand(`git branch -D ${tempBranch}`);
-    await this.runCommand('git stash pop');
+    try {
+      const validationOutput = await this.runCommand(validationCommand);
+      const failedFlagMatch = validationOutput.match(/\[FAILED:\s*(true|false)\]/);
+      const failed = failedFlagMatch 
+        ? failedFlagMatch[1] === 'true' 
+        : (validationOutput.includes('[COMMAND FAILED]') || validationOutput.includes('[COMMAND TIMEOUT]'));
 
-    return `Success: Speculative workspace patches validated successfully. Merged changes into branch ${cleanBranchName}.\nValidation output:\n${validationOutput}`;
+      if (failed) {
+        // Validation failed, restore all files to original content
+        for (const [fileAbs, content] of Object.entries(originalContents)) {
+          fs.writeFileSync(fileAbs, content, 'utf8');
+        }
+        return `Speculative workspace patch validation failed. Reverted all changes.\nCommand output:\n${validationOutput}`;
+      }
+
+      return `Success: Speculative workspace patches validated successfully. Kept changes.\nCommand output:\n${validationOutput}`;
+    } catch (e: any) {
+      // Restore files on error
+      for (const [fileAbs, content] of Object.entries(originalContents)) {
+        try { fs.writeFileSync(fileAbs, content, 'utf8'); } catch {}
+      }
+      return `Error running validation command, rolled back changes: ${e.message}`;
+    }
   }
 
   private static async updateDependencyGraph(): Promise<string> {
@@ -3650,7 +4971,7 @@ export const supabase = createClient(supabaseUrl, supabaseKey);
     const iterations = parseInt(iterationsStr) || 100;
 
     const fuzzScript = `
-const target = require('${relativeImportPath}');
+const target = module.require('${relativeImportPath}');
 const fn = target.${exportName};
 
 if (typeof fn !== 'function') {
@@ -3885,9 +5206,10 @@ if (crashCount === 0) {
           ts.ScriptTarget.Latest,
           true
         );
-        if (sourceFile.parseDiagnostics && sourceFile.parseDiagnostics.length > 0) {
-          const errors = sourceFile.parseDiagnostics
-            .map(d => {
+        const sf = sourceFile as any;
+        if (sf.parseDiagnostics && sf.parseDiagnostics.length > 0) {
+          const errors = sf.parseDiagnostics
+            .map((d: any) => {
               const { line, character } = sourceFile.getLineAndCharacterOfPosition(d.start || 0);
               const message = typeof d.messageText === 'string' 
                 ? d.messageText 

@@ -38,23 +38,26 @@ export async function activate(context: vscode.ExtensionContext) {
   // 3. Register document hooks for incremental vector updates on save
   context.subscriptions.push(
     vscode.workspace.onDidSaveTextDocument(async (document) => {
+      const filePath = document.uri.fsPath;
+      if (!shouldIndexFile(filePath)) {
+        return;
+      }
       const rel = vscode.workspace.asRelativePath(document.uri);
       if (
         rel.includes('node_modules') || 
         rel.includes('.git') || 
         rel.includes('dist') || 
         rel.includes('out') ||
-        rel.includes('build') ||
-        rel.includes('package-lock.json')
+        rel.includes('build')
       ) {
         return;
       }
       try {
-        await RAGService.indexFile(document.uri.fsPath, rel, document.getText());
+        await RAGService.indexFile(filePath, rel, document.getText());
         const mtimes = context.workspaceState.get<Record<string, number>>('indexedFilesMtimes') || {};
         try {
           const fs = require('fs');
-          mtimes[document.uri.fsPath] = fs.statSync(document.uri.fsPath).mtimeMs;
+          mtimes[filePath] = fs.statSync(filePath).mtimeMs;
           await context.workspaceState.update('indexedFilesMtimes', mtimes);
         } catch (err) {}
       } catch (e) {}
@@ -196,6 +199,15 @@ export async function activate(context: vscode.ExtensionContext) {
         }
         syncCodebaseIndex(context);
       }
+      if (
+        e.affectsConfiguration('k-horizon.embeddingProvider') ||
+        e.affectsConfiguration('k-horizon.embeddingModel') ||
+        e.affectsConfiguration('k-horizon.embeddingApiKey') ||
+        e.affectsConfiguration('k-horizon.embeddingBaseURL') ||
+        e.affectsConfiguration('k-horizon.aicreditsApiKey')
+      ) {
+        syncCodebaseIndex(context);
+      }
     })
   );
 }
@@ -229,9 +241,20 @@ function loadRepoInstructions(context: vscode.ExtensionContext) {
 
 async function syncCodebaseIndex(context: vscode.ExtensionContext) {
   const config = vscode.workspace.getConfiguration('k-horizon');
+  const embeddingProvider = config.get<string>('embeddingProvider', 'AICredits');
+  const embeddingApiKey = config.get<string>('embeddingApiKey', '');
   const aicreditsKey = config.get<string>('aicreditsApiKey', '');
-  if (!aicreditsKey) {
-    vscode.window.setStatusBarMessage('RAG: Set aicreditsApiKey to enable vector search', 8000);
+
+  const requiresEmbeddingKey = !['Ollama'].includes(embeddingProvider);
+  const hasEmbeddingKey = embeddingProvider === 'AICredits'
+    ? !!(embeddingApiKey || aicreditsKey)
+    : !!embeddingApiKey;
+
+  if (requiresEmbeddingKey && !hasEmbeddingKey) {
+    const settingName = embeddingProvider === 'AICredits'
+      ? 'embeddingApiKey or aicreditsApiKey'
+      : 'embeddingApiKey';
+    vscode.window.setStatusBarMessage(`RAG: Set ${settingName} to enable ${embeddingProvider} vector search`, 8000);
     return;
   }
 
@@ -281,6 +304,9 @@ async function syncCodebaseIndex(context: vscode.ExtensionContext) {
     for (const file of files) {
       try {
         const filePath = file.fsPath;
+        if (!shouldIndexFile(filePath)) {
+          continue;
+        }
         const currentMtime = fs.statSync(filePath).mtimeMs;
         
         // Skip if file exists in DB AND is registered in mtimes AND mtimes matches
@@ -353,4 +379,32 @@ export function deactivate() {
   }
   DBClient.disconnect();
   MCPManager.stopAllServers();
+}
+
+export function shouldIndexFile(filePath: string): boolean {
+  const ext = path.extname(filePath).toLowerCase();
+  const binaryExtensions = new Set([
+    '.png', '.jpg', '.jpeg', '.gif', '.webp', '.ico', '.pdf', '.zip', '.gz', '.tar', '.tgz', '.rar',
+    '.mp4', '.mp3', '.wav', '.avi', '.mov', '.flac', '.woff', '.woff2', '.ttf', '.eot', '.vsix',
+    '.exe', '.dll', '.so', '.dylib', '.bin', '.db', '.sqlite', '.sqlite3', '.pyc', '.class'
+  ]);
+  if (binaryExtensions.has(ext)) return false;
+
+  const baseName = path.basename(filePath).toLowerCase();
+  const excludedNames = new Set([
+    'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'bun.lockb',
+    '.ds_store', 'thumbs.db', '.gitignore', '.gitattributes'
+  ]);
+  if (excludedNames.has(baseName)) return false;
+
+  try {
+    const stats = fs.statSync(filePath);
+    if (stats.size > 1024 * 1024) { // 1MB limit
+      return false;
+    }
+  } catch {
+    return false;
+  }
+
+  return true;
 }

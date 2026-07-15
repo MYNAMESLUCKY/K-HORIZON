@@ -1,6 +1,6 @@
 import { StateGraph, Annotation, START, END, MemorySaver } from '@langchain/langgraph';
 import { AIService } from './ai-service';
-import { ToolManager } from './tool-manager';
+import { ToolManager, ToolCall } from './tool-manager';
 import { detectVerificationCommands } from './verification-commands';
 import { ChatMessage } from './types';
 import * as fs from 'fs';
@@ -72,7 +72,7 @@ export const AgentState = Annotation.Root({
   /** Maximum allowed loop iterations. */
   maxLoops: Annotation<number>({
     reducer: (_, v) => v,
-    default: () => 200,
+    default: () => 100,
   }),
 
   /** Whether to auto-approve tool execution. */
@@ -137,6 +137,20 @@ export const AgentState = Annotation.Root({
    *  When this exceeds 2 we force the agent into "summarize and ask" mode
    *  instead of burning another turn re-prompting for tool calls. */
   consecutiveTextOnlyHealResponses: Annotation<number>({
+    reducer: (_, v) => v,
+    default: () => 0,
+  }),
+
+  /** Number of consecutive times repromptToolCall has been invoked without
+   *  the agent producing a tool call. Used to break text-only reprompt loops. */
+  consecutiveReprompts: Annotation<number>({
+    reducer: (_, v) => v,
+    default: () => 0,
+  }),
+
+  /** Number of consecutive times continueUnfinishedTasks has been invoked
+   *  without the agent completing any task. Used to break task-reprompt loops. */
+  continueTaskReprompts: Annotation<number>({
     reducer: (_, v) => v,
     default: () => 0,
   }),
@@ -265,10 +279,40 @@ export const AgentState = Annotation.Root({
       default: () => false,
     }),
 
+    /** Original file contents before agent edit/write operations. */
+    fileBackups: Annotation<Record<string, string>>({
+      reducer: (existing, incoming) => ({ ...existing, ...incoming }),
+      default: () => ({}),
+    }),
+
     /** Number of security audit iterations performed (budget of 2). */
     auditAttempt: Annotation<number>({
       reducer: (_, v) => v,
       default: () => 0,
+    }),
+
+    /** Last encountered compile error message. */
+    lastCompileError: Annotation<string>({
+      reducer: (_, v) => v,
+      default: () => '',
+    }),
+
+    /** Fingerprint of the last compile error. */
+    lastCompileErrorFingerprint: Annotation<string>({
+      reducer: (_, v) => v,
+      default: () => '',
+    }),
+
+    /** Last encountered tool parser error message. */
+    lastParserError: Annotation<string>({
+      reducer: (_, v) => v,
+      default: () => '',
+    }),
+
+    /** Last encountered test failure message. */
+    lastTestError: Annotation<string>({
+      reducer: (_, v) => v,
+      default: () => '',
     }),
 
     /** Maximum allowed security audits. */
@@ -305,14 +349,25 @@ export const AgentState = Annotation.Root({
 // Type alias for convenience
 export type AgentStateType = typeof AgentState.State;
 
-// ─────────────────────────────────────────────────────────────
-// 2. Graph Node Functions
-// ─────────────────────────────────────────────────────────────
+function createCancellationTokenFromState(state: AgentStateType): { token: vscode.CancellationToken; cleanup: () => void } {
+  const cts = new vscode.CancellationTokenSource();
+  let interval: NodeJS.Timeout | undefined = undefined;
+  if (state.checkCancellation) {
+    interval = setInterval(() => {
+      if (state.checkCancellation?.()) {
+        cts.cancel();
+        if (interval) clearInterval(interval);
+      }
+    }, 100);
+  }
+  return {
+    token: cts.token,
+    cleanup: () => {
+      if (interval) clearInterval(interval);
+    }
+  };
+}
 
-/**
- * Node: callLLM
- * Streams a response from the configured LLM and appends the assistant message to chatHistory.
- */
 async function callLLM(state: AgentStateType): Promise<Partial<AgentStateType>> {
   if (!state.isRunning || state.checkCancellation?.()) {
     return { isRunning: false, lastAssistantResponse: '', pendingToolCalls: [] };
@@ -349,28 +404,106 @@ async function callLLM(state: AgentStateType): Promise<Partial<AgentStateType>> 
     let dynamicSystemInstruction = state.systemInstruction;
     if (state.implementationPlanSummary) {
       dynamicSystemInstruction += `\n\n## Current Implementation Plan\n${state.implementationPlanSummary}`;
+      dynamicSystemInstruction += `\n\nSTATUS: An implementation plan and task list have already been automatically created at \`.k-horizon/implementation_plan.md\` and \`.k-horizon/task.md\`. You MUST read \`.k-horizon/task.md\` first to see the tasks and proceed with executing them, updating the task list file as you complete them.`;
+    } else {
+      dynamicSystemInstruction += `\n\nSTATUS: No implementation plan was generated for this task because it is trivial or a direct/simple request. Do NOT look for, read, or write \`.k-horizon/implementation_plan.md\` or \`.k-horizon/task.md\`. Proceed directly to executing the user's request using the available tools.`;
     }
+
+    // Inject loop awareness so the LLM self-regulates
+    dynamicSystemInstruction += `\n\n## Execution Progress\nYou are on loop ${newLoopCount} of ${state.maxLoops}. Do NOT repeat tool calls you have already made. If a tool call returns an error or the same result as before, try a DIFFERENT approach or finalize your work.`;
+
+    // Wire last error into the prompt as structured diagnostic context (Fix 7)
+    if (state.lastCompileError) {
+      dynamicSystemInstruction += `\n\n## Previous Compile Error\n\`\`\`\n${state.lastCompileError.slice(0, 2000)}\n\`\`\`\nThis error occurred during a previous compile attempt. Address it before making further changes. If you have already fixed it, run the compile command again to confirm.`;
+    }
+    if (state.lastTestError) {
+      dynamicSystemInstruction += `\n\n## Previous Test Failure\n\`\`\`\n${state.lastTestError.slice(0, 2000)}\n\`\`\`\nThis test failure occurred during a previous test run. Address it before continuing.`;
+    }
+    if (state.lastParserError) {
+      dynamicSystemInstruction += `\n\n## Previous Tool Parser Error\n\`\`\`\n${state.lastParserError.slice(0, 1000)}\n\`\`\`\nA tool-call parsing error occurred on the previous turn. Ensure your tool calls use valid JSON format.`;
+    }
+
     const currentSub = SUBAGENTS.find(s => s.id === state.currentSubagentId);
     if (currentSub) {
       dynamicSystemInstruction += `\n\n## Active Subagent Mode: ${currentSub.label}\n${currentSub.systemPrompt}`;
     }
 
-    const llmResult = await AIService.streamResponseDetailed(
-      cleanHistory,
-      dynamicSystemInstruction,
-      (token) => {
-        if (state.isRunning) {
-          state.onToken?.(token);
+    dynamicSystemInstruction += `\n\n### Tool Selection Guidelines & Hierarchy:
+You have tools to query the codebase and make edits. Follow this hierarchy. Only THREE file-modification tools exist — do not invent others:
+0. **External MCP Tools (Highest Preference / Priority):**
+   - Prioritize external MCP tools over built-in equivalents. E.g., use \`mcp__Filesystem__read_file\` instead of \`read_file\`, \`mcp__Filesystem__write_file\` instead of \`write_file\`, \`mcp__Filesystem__list_directory\` instead of \`list_dir\`, \`mcp__Filesystem__search_grep\` instead of \`grep_search\`, and \`mcp__Git__*\` tools instead of \`git_status\` / \`git_diff\`.
+1. **File Modification (only three tools):**
+   - \`read_file\` — Read a file's contents.
+   - \`write_file\` — Create a new file or overwrite an entire file.
+   - \`edit_file\` — Make a targeted search/replace edit in an existing file (preferred over \`write_file\` for surgical changes).
+   - \`delete_file\` — Delete a file.
+   - \`create_directory\` — Create directories.
+   - \`copy_file\` / \`move_file\` — Copy or move files.
+   - ⚠️ Do NOT use \`patch_file_lines\`, \`insert_file_lines\`, \`replace_in_files\`, \`run_speculative_patch\`, or \`run_speculative_workspace_patch\` — these have been removed. Use \`edit_file\` (search/replace) instead.
+2. **Codebase Symbol & Reference Analysis (LSP Preference):**
+   - To find definitions, callers, or trace where things are used: Use \`find_definitions\`, \`find_references\`, or \`trace_symbol_dependency\` (uses VS Code's LSP). Avoid reading random files or raw grep searching if you can trace symbols directly.
+   - To check file metadata (size, lines, modified time) without loading contents: Use \`get_file_metadata\` (highly token-efficient!).
+   - To query functions, classes, or types workspace-wide: Use \`search_workspace_symbols\`.
+   - To check file-wide outlines: Use \`get_file_outline\`.
+3. **Keyword & Directory Search:**
+   - To find files matching a name pattern: Use \`find_files\`.
+   - To search for text snippets or matches globally: Use \`grep_search\`.
+   - To list directory contents: Use \`list_dir\`.
+4. **Shell & Verification Commands:**
+   - To run tests, compile builds, or execute shell checks: Use \`run_command\`. Pass the \`directory\` parameter if running in a subdirectory; NEVER use \`cd\` inside the command. ⚠️ Only allowed commands: \`npm\`, \`npx\`, \`node\`, \`git\`, \`tsc\`, \`webpack\`, \`vitest\`, \`jest\`, \`eslint\`, \`pwsh\`, \`powershell\`, \`cmd\`, and \`dir\`. Blocked: \`rm\`, \`del\`, \`rd\`, \`format\`, \`diskpart\`, \`reg\`, \`wget\`, \`curl\`, \`Invoke-WebRequest\`, and any network/destructive commands.
+   - To view current git status or git diff: Use \`git_status\` or \`git_diff\`.
+   - To inspect git changes for a single file: Use \`git_diff_file\`.
+   - To verify that your edits succeeded and compile cleanly: Use \`verify_edit\`.`;
+
+    const { token: cancelToken, cleanup } = createCancellationTokenFromState(state);
+    let llmResult: any;
+    try {
+      let attempts = 0;
+      const maxAttempts = 3;
+      while (attempts < maxAttempts) {
+        try {
+          llmResult = await AIService.streamResponseDetailed(
+            cleanHistory,
+            dynamicSystemInstruction,
+            (token) => {
+              if (state.isRunning) {
+                state.onToken?.(token);
+              }
+            },
+            state.modelConfig?.modelId || coderModel || undefined,
+            state.modelConfig?.provider || undefined,
+            state.modelConfig?.temperature,
+            cancelToken,
+            { enableTools: true }
+          );
+          
+          const textEmpty = !llmResult.text || llmResult.text.trim() === '';
+          const reasoningEmpty = !llmResult.reasoning || llmResult.reasoning.trim() === '';
+          const toolsEmpty = !llmResult.toolCalls || llmResult.toolCalls.length === 0;
+
+          if (textEmpty && reasoningEmpty && toolsEmpty) {
+            attempts++;
+            if (attempts < maxAttempts) {
+              state.onToken?.(`\n\n🔄 **Received empty response from LLM. Retrying (Attempt ${attempts + 1} of ${maxAttempts})...**\n`);
+              await new Promise(r => setTimeout(r, 1000 * attempts));
+              continue;
+            }
+          }
+          break;
+        } catch (err: any) {
+          attempts++;
+          if (attempts >= maxAttempts) {
+            throw err;
+          }
+          state.onToken?.(`\n\n🔄 **LLM call failed: ${err.message}. Retrying (Attempt ${attempts + 1} of ${maxAttempts})...**\n`);
+          await new Promise(r => setTimeout(r, 1000 * attempts));
         }
-      },
-      state.modelConfig?.modelId || coderModel || undefined,
-      state.modelConfig?.provider || undefined,
-      state.modelConfig?.temperature,
-      undefined,
-      { enableTools: true }
-    );
+      }
+    } finally {
+      cleanup();
+    }
     const fullResponseText = llmResult.text;
-    const nativeToolCalls = llmResult.toolCalls;
+    const nativeToolCalls: ToolCall[] = llmResult.toolCalls;
     // Reasoning text is captured in llmResult.reasoning but deliberately NOT
     // stored in chatHistory or lastAssistantResponse. Storing it would waste
     // context tokens and pollute the conversation with model-internal monologue.
@@ -379,7 +512,23 @@ async function callLLM(state: AgentStateType): Promise<Partial<AgentStateType>> 
     // Guard: if the LLM returns nothing, treat as a soft stop rather than storing
     // an empty assistant message which would break subsequent API calls.
     if ((!fullResponseText || fullResponseText.trim() === '') && nativeToolCalls.length === 0) {
-      state.onToken?.('\n\n⚠️ **Warning:** LLM returned an empty response. Stopping agent.\n');
+      if (llmResult.reasoning && llmResult.reasoning.trim() !== '') {
+        state.onToken?.('\n\n⚠️ **Warning:** LLM generated reasoning but no final response or tool call. Reprompting to complete the turn...\n');
+        const repromptMsg: ChatMessage = {
+          role: 'user',
+          content: 'You outputted thinking/reasoning but no tool call or final text. Please output your next action using the JSON tool-call format now.',
+          timestamp: Date.now()
+        };
+        return {
+          chatHistory: [repromptMsg],
+          loopCount: newLoopCount,
+          lastAssistantResponse: '',
+          lastAssistantToolCalls: [],
+          pendingToolCalls: []
+        };
+      }
+
+      state.onToken?.('\n\n⚠️ **Warning:** LLM returned a completely empty response. Stopping agent.\n');
       return {
         isRunning: false,
         loopCount: newLoopCount,
@@ -400,7 +549,12 @@ async function callLLM(state: AgentStateType): Promise<Partial<AgentStateType>> 
       sessionId: state.sessionId,
       type: 'llm_finish',
       timestamp: Date.now(),
-      data: { loopCount: newLoopCount, responseChars: fullResponseText.length, nativeToolCallCount: nativeToolCalls.length },
+      data: {
+        loopCount: newLoopCount,
+        responseChars: fullResponseText.length,
+        nativeToolCallCount: nativeToolCalls.length,
+        responsePreview: fullResponseText.slice(0, 500),
+      },
     });
 
     return {
@@ -434,14 +588,31 @@ async function parseToolCalls(state: AgentStateType): Promise<Partial<AgentState
   const toolCalls = state.lastAssistantToolCalls && state.lastAssistantToolCalls.length > 0
     ? ToolManager.normalizeNativeToolCalls(state.lastAssistantToolCalls)
     : ToolManager.parseToolCalls(state.lastAssistantResponse || '');
+
+  const lastParserError = ToolManager.lastParserError || '';
+
   AgentTrace.append({
     runId: state.runId || 'unknown',
     sessionId: state.sessionId,
     type: 'tool_calls_parsed',
     timestamp: Date.now(),
-    data: { count: toolCalls.length, names: toolCalls.map(call => call.name) },
+    data: {
+      count: toolCalls.length,
+      names: toolCalls.map(call => call.name),
+      parserError: lastParserError || undefined,
+      responsePreview: toolCalls.length === 0 ? (state.lastAssistantResponse || '').slice(0, 500) : undefined,
+    },
   });
-  return { pendingToolCalls: toolCalls };
+
+  const updates: Partial<AgentStateType> = { 
+    pendingToolCalls: toolCalls,
+    lastParserError
+  };
+  if (toolCalls.length > 0) {
+    updates.consecutiveReprompts = 0;
+    updates.continueTaskReprompts = 0;
+  }
+  return updates;
 }
 
 /**
@@ -454,8 +625,29 @@ async function executeTools(state: AgentStateType): Promise<Partial<AgentStateTy
     return { isRunning: !state.checkCancellation?.() };
   }
 
+  // Backup files about to be modified
+  const newBackups: Record<string, string> = {};
+  for (const c of state.pendingToolCalls) {
+    if (['edit_file', 'write_file', 'patch_file_lines', 'insert_file_lines'].includes(c.name)) {
+      const filePath = c.arguments.file_path;
+      if (filePath) {
+        try {
+          const abs = ToolManager.getAbsolutePath(filePath);
+          if (abs && fs.existsSync(abs)) {
+            if (state.fileBackups && !state.fileBackups[abs] && !newBackups[abs]) {
+              newBackups[abs] = fs.readFileSync(abs, 'utf8');
+            }
+          }
+        } catch (e) {
+          // Ignore read/exists errors during backup check
+        }
+      }
+    }
+  }
+
   let gitRollbackSafe = state.gitRollbackSafe;
   let gitSavepointChecked = state.gitSavepointChecked;
+  let lastCompileErrorFingerprint = state.lastCompileErrorFingerprint || '';
 
   if (!gitSavepointChecked) {
     gitSavepointChecked = true;
@@ -508,6 +700,10 @@ async function executeTools(state: AgentStateType): Promise<Partial<AgentStateTy
       const patches = [] as Array<{ file_path: string; target_content: string; replacement_content: string }>;
       for (const c of fileModCalls) {
         if (c.name === 'edit_file') {
+          if (c.arguments.target_content === undefined || c.arguments.replacement_content === undefined) {
+            patches.length = 0;
+            break;
+          }
           patches.push({ file_path: c.arguments.file_path, target_content: c.arguments.target_content, replacement_content: c.arguments.replacement_content });
         } else if (c.name === 'patch_file_lines') {
           // Convert patch_file_lines to a whole-file replacement for speculative run
@@ -551,6 +747,7 @@ async function executeTools(state: AgentStateType): Promise<Partial<AgentStateTy
             currentSubagentId: nextSubagentId,
             gitRollbackSafe,
             gitSavepointChecked,
+            fileBackups: newBackups,
           };
         } else {
           // Speculative validation failed — append message so model can see output and decide next steps.
@@ -666,10 +863,27 @@ async function executeTools(state: AgentStateType): Promise<Partial<AgentStateTy
         // Non-fatal: proceed even if dependency graph update fails
       }
       let finalArgs = { ...toolArgs };
-      const toolAllowed = call.name === 'switch_subagent' || isToolAllowedForSubagent(state.currentSubagentId as SubagentId, call.name);
 
-      if (!toolAllowed) {
-        result = `Error: Tool "${call.name}" is not allowed for subagent "${state.currentSubagentId}".`;
+      // First check: does this tool even exist? Use the subagent's COMMON_TOOLS
+      // list as the reference for known tools. MCP tools (mcp__*) and switch_subagent
+      // are always allowed through.
+      const isMCPTool = call.name.startsWith('mcp__');
+      const isSpecialTool = call.name === 'switch_subagent';
+      const toolAllowed = isSpecialTool || isToolAllowedForSubagent(state.currentSubagentId as SubagentId, call.name);
+
+      if (!toolAllowed && !isMCPTool) {
+        // Check if the tool is genuinely unknown (hallucinated) vs just blocked for this subagent
+        const allToolNames = SUBAGENTS.find(s => s.id === 'general-builder')?.toolAllowList || [];
+        const isKnownTool = allToolNames.some(t => {
+          if (t === call.name) return true;
+          if (t.endsWith('*')) return call.name.startsWith(t.slice(0, -1));
+          return false;
+        });
+        if (!isKnownTool) {
+          result = `Error: Unknown tool "${call.name}". This tool does not exist. You MUST use one of the available tools listed in your system prompt (e.g., read_file, write_file, edit_file, delete_file, run_command, list_dir, grep_search, find_files, etc.). Do NOT invent tool names.`;
+        } else {
+          result = `Error: Tool "${call.name}" is not allowed for subagent "${state.currentSubagentId}". Try switching to the "general-builder" subagent first using: {"name":"switch_subagent","arguments":{"subagent_id":"general-builder"}}`;
+        }
         proceed = false;
       }
 
@@ -722,9 +936,11 @@ async function executeTools(state: AgentStateType): Promise<Partial<AgentStateTy
         // the edit succeeded but introduced a new TypeScript error (off-by-one line shift,
         // accidental overwrite of adjacent code, mismatched braces, etc.). The diagnostics
         // are appended to the tool result so the next LLM turn sees them.
-        if ((call.name === 'write_file' || call.name === 'edit_file') && finalArgs.file_path) {
+        const filePath = finalArgs.file_path || '';
+        const isCodeOrConfig = filePath && /\.(ts|tsx|js|jsx|json)$/i.test(filePath);
+        if ((call.name === 'write_file' || call.name === 'edit_file') && filePath && isCodeOrConfig) {
           try {
-            const verifyResult = await ToolManager.execute('verify_edit', { file_path: finalArgs.file_path });
+            const verifyResult = await ToolManager.execute('verify_edit', { file_path: filePath });
             const verifyDiagnostics = verifyResult.split('\nDiagnostics:\n')[1] || '';
             const hasErrors = /\[Error\]/.test(verifyDiagnostics);
             const verifySuffix = hasErrors
@@ -744,8 +960,29 @@ async function executeTools(state: AgentStateType): Promise<Partial<AgentStateTy
               if (cmds.compileCommand) {
                 const compileOut = await ToolManager.execute('run_command', { command: cmds.compileCommand });
                 const failedFlagMatch = compileOut.match(/\[FAILED:\s*(true|false)\]/);
-                const failed = failedFlagMatch ? failedFlagMatch[1] === 'true' : (compileOut.includes('[COMMAND FAILED]') || compileOut.includes('[COMMAND TIMEOUT]'));
-                const compileSuffix = failed ? `\n\n[AUTO-COMPILE] ⚠️ Compile failed after this edit:\n${compileOut}` : `\n\n[AUTO-COMPILE] ✅ Compile succeeded after this edit.`;
+                const failed = failedFlagMatch ? failedFlagMatch[1] === 'true' : (compileOut.includes('[COMMAND FAILED]') || compileOut.includes('[COMMAND TIMEOUT]') || compileOut.trim().startsWith('Error:'));
+                let compileSuffix = '';
+                if (failed) {
+                  const compileFingerprint = getCompileErrorFingerprint(compileOut);
+                  if (state.lastCompileErrorFingerprint && compileFingerprint === state.lastCompileErrorFingerprint) {
+                    compileSuffix = `\n\n[AUTO-COMPILE] ⚠️ Compile failed with the same error as last time. (Diagnostic output omitted to reduce context bloat).`;
+                  } else {
+                    lastCompileErrorFingerprint = compileFingerprint;
+                    const hasMissingLocalImports = 
+                      /error TS2307: Cannot find module ['"]\.[^'"]+['"]/i.test(compileOut) ||
+                      /cannot find module ['"]\.[^'"]+['"]/i.test(compileOut) ||
+                      /can't resolve ['"]\.[^'"]+['"]/i.test(compileOut) ||
+                      /ModuleNotFoundError: No module named ['"]\.[^'"]+['"]/i.test(compileOut);
+                    let hint = '';
+                    if (hasMissingLocalImports) {
+                      hint = `\n\n⚠️ **IMPORTANT**: This compile failure is likely because the imported local files/components (relative imports starting with ".") do not exist in the workspace yet. Do NOT delete, rollback, or undo your changes. Instead, simply proceed to create the missing files/components in your next step.`;
+                    }
+                    compileSuffix = `\n\n[AUTO-COMPILE] ⚠️ Compile failed after this edit:\n${compileOut}${hint}`;
+                  }
+                } else {
+                  compileSuffix = `\n\n[AUTO-COMPILE] ✅ Compile succeeded after this edit.`;
+                  lastCompileErrorFingerprint = '';
+                }
                 result = result + compileSuffix;
                 resultPreview = resultPreview + compileSuffix;
               }
@@ -770,7 +1007,8 @@ async function executeTools(state: AgentStateType): Promise<Partial<AgentStateTy
     }
 
     let resultForModel = result;
-    const maxResultLen = 16000;
+    const isEditOrFileTool = ['edit_file', 'patch_file_lines', 'write_file', 'verify_edit'].includes(call.name);
+    const maxResultLen = isEditOrFileTool ? 3000 : 16000;
     if (result.length > maxResultLen) {
       if (call.name === 'run_command') {
         // For npm-style outputs we keep the structured summary header intact
@@ -811,9 +1049,10 @@ async function executeTools(state: AgentStateType): Promise<Partial<AgentStateTy
           middle +
           `\n\n... [TRUNCATED ${truncatedBodyLen} NON-DIAGNOSTIC CHARACTERS FROM ${body.length}-CHAR BODY; HEAD/TAIL omitted to preserve npm ERR! lines] ...\n`;
       } else {
-        resultForModel = result.substring(0, 6000) +
-          `\n\n... [TRUNCATED ${result.length - 12000} CHARACTERS FOR BREVITY] ...\n\n` +
-          result.substring(result.length - 6000);
+        const keepLen = Math.floor(maxResultLen / 2);
+        resultForModel = result.substring(0, keepLen) +
+          `\n\n... [TRUNCATED ${result.length - maxResultLen} CHARACTERS FOR BREVITY] ...\n\n` +
+          result.substring(result.length - keepLen);
       }
     }
 
@@ -831,15 +1070,17 @@ async function executeTools(state: AgentStateType): Promise<Partial<AgentStateTy
      timestamp: Date.now(),
    };
 
-   return {
-     chatHistory: [toolResultMessage],
-     pendingToolCalls: [],
-     awaitingSelfHealResponse: false,
-     codeChangesMade: madeCodeChange,
-     currentSubagentId: nextSubagentId,
-     gitRollbackSafe,
-     gitSavepointChecked,
-   };
+    return {
+      chatHistory: [toolResultMessage],
+      pendingToolCalls: [],
+      awaitingSelfHealResponse: false,
+      codeChangesMade: madeCodeChange,
+      currentSubagentId: nextSubagentId,
+      gitRollbackSafe,
+      gitSavepointChecked,
+      fileBackups: newBackups,
+      lastCompileErrorFingerprint,
+    };
 }
 
 /**
@@ -870,16 +1111,43 @@ async function runCompile(state: AgentStateType): Promise<Partial<AgentStateType
   const npmCodeMatch = buildOutput.match(/\[NPM_ERR_CODE:\s*([^\]]+)\]/);
   const exitCodeStr = exitMatch ? exitMatch[1].trim() : '';
   const exitCodeNum = exitCodeStr === 'null' ? null : parseInt(exitCodeStr, 10);
-  const failed = failedFlagMatch ? failedFlagMatch[1] === 'true' : (buildOutput.includes('[COMMAND FAILED]') || buildOutput.includes('[COMMAND TIMEOUT]'));
+  const failed = failedFlagMatch ? failedFlagMatch[1] === 'true' : (buildOutput.includes('[COMMAND FAILED]') || buildOutput.includes('[COMMAND TIMEOUT]') || buildOutput.trim().startsWith('Error:'));
 
   if (failed) {
     const attemptNum = state.compileHealAttempts + 1;
 
+    const hasMissingLocalImports = 
+      /error TS2307: Cannot find module ['"]\.[^'"]+['"]/i.test(buildOutput) ||
+      /cannot find module ['"]\.[^'"]+['"]/i.test(buildOutput) ||
+      /can't resolve ['"]\.[^'"]+['"]/i.test(buildOutput) ||
+      /ModuleNotFoundError: No module named ['"]\.[^'"]+['"]/i.test(buildOutput);
+
+    if (hasMissingLocalImports) {
+      state.onToken?.('\n\nℹ️ **Missing local files detected. Bypassing compilation self-healing so you can proceed to create the missing files.**\n');
+      return {
+        compileCompleted: true,
+        awaitingSelfHealResponse: false,
+        consecutiveTextOnlyHealResponses: 0,
+        lastCompileError: '',
+        finalResponse: '\n\nℹ️ **Compilation Bypassed:** Missing local files/imports detected. Proceeding to let you create the missing files.',
+      };
+    }
+
     if (attemptNum > 3) {
       state.onToken?.('\n\n❌ **Auto-Compile failed to resolve errors after 3 attempts.**\n');
+      
       if (state.gitRollbackSafe) {
         state.onToken?.('⚠️ **Git-Backed Rollback:** Reverting workspace changes to last clean state...\n');
         await ToolManager.execute('run_command', { command: 'git reset --hard HEAD && git clean -fd' });
+      } else if (state.fileBackups && Object.keys(state.fileBackups).length > 0) {
+        state.onToken?.('⚠️ **Workspace Rollback:** Reverting modified files to pre-edit state...\n');
+        for (const [fileAbs, originalContent] of Object.entries(state.fileBackups)) {
+          try {
+            fs.writeFileSync(fileAbs, originalContent, 'utf8');
+          } catch (restoreErr) {
+            console.error(`Failed to restore backup for ${fileAbs}:`, restoreErr);
+          }
+        }
       }
       return { compileCompleted: true, compileHealAttempts: attemptNum, awaitingSelfHealResponse: false, consecutiveTextOnlyHealResponses: 0 };
     }
@@ -911,7 +1179,12 @@ async function runCompile(state: AgentStateType): Promise<Partial<AgentStateType
       richerDiagnostics = `Error gathering richer diagnostics: ${e.message || e}`;
     }
 
-    const fixPrompt = `The project build failed.
+    let missingLocalHint = '';
+    if (hasMissingLocalImports) {
+      missingLocalHint = `\n\n⚠️ **IMPORTANT**: This compile failure is likely because the imported local files/components (e.g. relative imports starting with ".") do not exist in the workspace yet. Do NOT delete or undo your changes to the import statements. Instead, simply proceed to create the missing files/components (e.g. create the components) in this turn.`;
+    }
+
+    const fixPrompt = `The project build failed. ${missingLocalHint}
 
 Failure summary (parsed from the command output, not guessed):
 \`\`\`
@@ -930,13 +1203,27 @@ ${liveDiagnostics}
 
 Instructions:
 1. Read the FAILURE SUMMARY first. The npm error code, category, and remediation hint above are derived from the actual \`npm ERR!\` lines, not substring guesses — trust them.
-2. If the category is \`eresolve\` / \`epeer\` / \`eacces\` / \`enoent\` / \`missing-script\` / \`missing-package-json\` / \`command-not-found\`, do NOT edit unrelated code. Address the package.json / install / path issue described in the remediation hint.
+2. If the category is \`eresolve\` / \`epeer\` / \`eacces\` / \`enoent\` / \`missing-script\` / \`missing-package-json\` / \`command-not-found\` / \`missing-dependency\`, do NOT edit unrelated code. Address the package.json / install / path issue described in the remediation hint.
 3. If the category is \`compile\`, open the file at the line/column reported by tsc and fix the type or import error.
-4. If the category is \`elifecycle\`, the ELIFECYCLE line is just a wrapper — read the underlying error message above it for the actual root cause.
-5. Only edit files inside the workspace. Do not invent fictional npm scripts.
-6. After making changes, output the actual JSON tool call — {"name": "edit_file", "arguments": {...}} (or an array of such calls) — so the agent parser can execute it. Do not write a markdown code block; that will be ignored.`;
+4. If the compile error is about a missing import or module export, do NOT guess the exports. You MUST read the imported file/module first (using the read_file tool) to see what it actually exports and use the correct export name and type.
+5. If the compile error is an implicit 'any' error, add explicit TypeScript types to the reported parameters/variables.
+6. If the compile error is an unused variable or import warning/error, remove the unused declaration.
+7. If the compile error is a type mismatch for animation/easing arrays, cast the array as const (e.g., [0.6, 0.05, -0.01, 0.9] as const).
+8. If the category is \`elifecycle\`, the ELIFECYCLE line is just a wrapper — read the underlying error message above it for the actual root cause.
+9. Only edit files inside the workspace. Do not invent fictional npm scripts.
+10. After making changes, output the actual JSON tool call — {"name": "edit_file", "arguments": {...}} (or an array of such calls) — so the agent parser can execute it. Do not write a markdown code block; that will be ignored.`;
 
-    const fixPromptWithDiagnostics = fixPrompt + '\n\nRicher Failure Diagnostics (re-run, git-diff, file preview):\n\n``\n' + richerDiagnostics + '\n```';
+    let historicalFixesPrompt = '';
+    if (state.workspaceRoot) {
+      try {
+        const { ErrorFixMemoryManager } = await import('./learning-manager');
+        historicalFixesPrompt = await ErrorFixMemoryManager.findMatchingFixesAsPrompt(state.workspaceRoot, buildOutput);
+      } catch (e) {
+        console.error('Failed to load historical fixes:', e);
+      }
+    }
+
+    const fixPromptWithDiagnostics = fixPrompt + '\n\nRicher Failure Diagnostics (re-run, git-diff, file preview):\n\n```\n' + richerDiagnostics + '\n```' + historicalFixesPrompt;
 
     const fixMessage: ChatMessage = {
       role: 'user',
@@ -951,13 +1238,26 @@ Instructions:
       compileCompleted: false,
       awaitingSelfHealResponse: true,
       consecutiveTextOnlyHealResponses: 0,
+      lastCompileError: buildOutput
     };
   } else {
+    // Compile succeeded!
+    if (state.compileHealAttempts > 0 && state.lastCompileError && state.workspaceRoot && state.fileBackups) {
+      import('./learning-manager').then(async ({ ErrorFixMemoryManager }) => {
+        const diffStr = ErrorFixMemoryManager.generateDiffString(state.fileBackups, state.workspaceRoot);
+        const modifiedFiles = Object.keys(state.fileBackups).map(f => path.relative(state.workspaceRoot, f).replace(/\\/g, '/'));
+        if (diffStr) {
+          await ErrorFixMemoryManager.saveFix(state.workspaceRoot, state.lastCompileError, 'compile', modifiedFiles, diffStr);
+        }
+      }).catch(() => {});
+    }
+
     state.onToken?.('\n\n✨ **Build verified successfully! Project compiled with zero errors.**\n');
     return {
       compileCompleted: true,
       awaitingSelfHealResponse: false,
       consecutiveTextOnlyHealResponses: 0,
+      lastCompileError: '',
       finalResponse: '\n\n✨ **Build Verified:** Project compiled successfully.',
     };
   }
@@ -993,16 +1293,36 @@ async function runTest(state: AgentStateType): Promise<Partial<AgentStateType>> 
   const npmCodeMatch = testOutput.match(/\[NPM_ERR_CODE:\s*([^\]]+)\]/);
   const exitCodeStr = exitMatch ? exitMatch[1].trim() : '';
   const exitCodeNum = exitCodeStr === 'null' ? null : parseInt(exitCodeStr, 10);
-  const failed = failedFlagMatch ? failedFlagMatch[1] === 'true' : (testOutput.includes('[COMMAND FAILED]') || testOutput.includes('[COMMAND TIMEOUT]'));
+  const failed = failedFlagMatch ? failedFlagMatch[1] === 'true' : (testOutput.includes('[COMMAND FAILED]') || testOutput.includes('[COMMAND TIMEOUT]') || testOutput.trim().startsWith('Error:'));
 
   if (failed) {
     const attemptNum = state.testHealAttempts + 1;
 
     if (attemptNum > 3) {
       state.onToken?.('\n❌ **Auto-Test Failed:** Could not resolve test failures after 3 attempts.\n');
-      if (state.gitRollbackSafe) {
-        state.onToken?.('⚠️ **Git-Backed Rollback:** Reverting workspace changes to last clean state...\n');
-        await ToolManager.execute('run_command', { command: 'git reset --hard HEAD && git clean -fd' });
+      
+      const hasMissingLocalImports = 
+        /error TS2307: Cannot find module ['"]\.[^'"]+['"]/i.test(testOutput) ||
+        /cannot find module ['"]\.[^'"]+['"]/i.test(testOutput) ||
+        /can't resolve ['"]\.[^'"]+['"]/i.test(testOutput) ||
+        /ModuleNotFoundError: No module named ['"]\.[^'"]+['"]/i.test(testOutput);
+        
+      if (hasMissingLocalImports) {
+        state.onToken?.('ℹ️ **Missing local files detected. Skipping workspace rollback to let you create the missing files.**\n');
+      } else {
+        if (state.gitRollbackSafe) {
+          state.onToken?.('⚠️ **Git-Backed Rollback:** Reverting workspace changes to last clean state...\n');
+          await ToolManager.execute('run_command', { command: 'git reset --hard HEAD && git clean -fd' });
+        } else if (state.fileBackups && Object.keys(state.fileBackups).length > 0) {
+          state.onToken?.('⚠️ **Workspace Rollback:** Reverting modified files to pre-edit state...\n');
+          for (const [fileAbs, originalContent] of Object.entries(state.fileBackups)) {
+            try {
+              fs.writeFileSync(fileAbs, originalContent, 'utf8');
+            } catch (restoreErr) {
+              console.error(`Failed to restore backup for ${fileAbs}:`, restoreErr);
+            }
+          }
+        }
       }
       return { testCompleted: true, testHealAttempts: attemptNum, awaitingSelfHealResponse: false, consecutiveTextOnlyHealResponses: 0 };
     }
@@ -1031,7 +1351,18 @@ async function runTest(state: AgentStateType): Promise<Partial<AgentStateType>> 
       richerTestDiagnostics = `Error gathering richer diagnostics: ${e.message || e}`;
     }
 
-    const testFixPrompt = `The project tests failed.
+    let missingLocalHint = '';
+    const hasMissingLocalImports = 
+      /error TS2307: Cannot find module ['"]\.[^'"]+['"]/i.test(testOutput) ||
+      /cannot find module ['"]\.[^'"]+['"]/i.test(testOutput) ||
+      /can't resolve ['"]\.[^'"]+['"]/i.test(testOutput) ||
+      /ModuleNotFoundError: No module named ['"]\.[^'"]+['"]/i.test(testOutput);
+    
+    if (hasMissingLocalImports) {
+      missingLocalHint = `\n\n⚠️ **IMPORTANT**: This test failure is likely because the imported local files/components (e.g. relative imports starting with ".") do not exist in the workspace yet. Do NOT delete or undo your changes to the import statements. Instead, simply proceed to create the missing files/components (e.g. create the components) in this turn.`;
+    }
+
+    const testFixPrompt = `The project tests failed. ${missingLocalHint}
 
 Failure summary (parsed from the command output, not guessed):
 \`\`\`
@@ -1045,11 +1376,25 @@ ${testOutput}
 
 Instructions:
 1. Read the FAILURE SUMMARY first.
-2. If the category is \`compile\` or \`eresolve\` / \`epeer\` / \`missing-package-json\`, fix the build/dependency problem first — tests can't pass against a project that doesn't compile.
-3. Otherwise look at the assertion failure: which file, which test, expected vs actual. Fix the code under test (not the test expectations) unless the test expectation itself is wrong.
-4. Output the actual JSON tool call — {"name": "edit_file", "arguments": {...}} (or an array of such calls) — so the agent parser can execute it. Do not write a markdown code block; that will be ignored.`;
+2. If the category is \`compile\` or \`eresolve\` / \`epeer\` / \`missing-package-json\` / \`missing-dependency\`, fix the build/dependency problem first — tests can't pass against a project that doesn't compile.
+3. If the compile error is about a missing import or module export, do NOT guess the exports. You MUST read the imported file/module first (using the read_file tool) to see what it actually exports and use the correct export name and type.
+4. If the compile error is an implicit 'any' error, add explicit TypeScript types to the reported parameters/variables.
+5. If the compile error is an unused variable or import warning/error, remove the unused declaration.
+6. If the compile error is a type mismatch for animation/easing arrays, cast the array as const (e.g., [0.6, 0.05, -0.01, 0.9] as const).
+7. Otherwise look at the assertion failure: which file, which test, expected vs actual. Fix the code under test (not the test expectations) unless the test expectation itself is wrong.
+8. Output the actual JSON tool call — {"name": "edit_file", "arguments": {...}} (or an array of such calls) — so the agent parser can execute it. Do not write a markdown code block; that will be ignored.`;
 
-    const testFixPromptWithDiagnostics = testFixPrompt + '\n\nRicher Failure Diagnostics (re-run, git-diff, file preview):\n\n``\n' + richerTestDiagnostics + '\n```';
+    let historicalFixesPrompt = '';
+    if (state.workspaceRoot) {
+      try {
+        const { ErrorFixMemoryManager } = await import('./learning-manager');
+        historicalFixesPrompt = await ErrorFixMemoryManager.findMatchingFixesAsPrompt(state.workspaceRoot, testOutput);
+      } catch (e) {
+        console.error('Failed to load historical fixes:', e);
+      }
+    }
+
+    const testFixPromptWithDiagnostics = testFixPrompt + '\n\nRicher Failure Diagnostics (re-run, git-diff, file preview):\n\n```\n' + richerTestDiagnostics + '\n```' + historicalFixesPrompt;
 
     const fixMessage: ChatMessage = {
       role: 'user',
@@ -1064,14 +1409,27 @@ Instructions:
       testCompleted: false,
       awaitingSelfHealResponse: true,
       consecutiveTextOnlyHealResponses: 0,
+      lastTestError: testOutput
     };
   } else {
+    // Test succeeded!
+    if (state.testHealAttempts > 0 && state.lastTestError && state.workspaceRoot && state.fileBackups) {
+      import('./learning-manager').then(async ({ ErrorFixMemoryManager }) => {
+        const diffStr = ErrorFixMemoryManager.generateDiffString(state.fileBackups, state.workspaceRoot);
+        const modifiedFiles = Object.keys(state.fileBackups).map(f => path.relative(state.workspaceRoot, f).replace(/\\/g, '/'));
+        if (diffStr) {
+          await ErrorFixMemoryManager.saveFix(state.workspaceRoot, state.lastTestError, 'test-failure', modifiedFiles, diffStr);
+        }
+      }).catch(() => {});
+    }
+
     state.onToken?.('\n✨ **Auto-Test Passed:** All unit tests compiled and passed successfully!\n');
     return {
       testCompleted: true,
       awaitingSelfHealResponse: false,
       consecutiveTextOnlyHealResponses: 0,
       finalResponse: '\n\n✨ **Auto-Test Verified:** All unit tests passed successfully.',
+      lastTestError: ''
     };
   }
 }
@@ -1122,16 +1480,22 @@ ${diffOutput}
     const settings = AIService.getSettings();
     const coderModel = settings.coderModel || settings.chatModel;
 
-    const llmResult = await AIService.streamResponseDetailed(
-      [{ role: 'user', content: auditPrompt, timestamp: Date.now() }],
-      auditSystemPrompt,
-      (token) => {},
-      state.modelConfig?.modelId || coderModel || undefined,
-      state.modelConfig?.provider || undefined,
-      state.modelConfig?.temperature,
-      undefined,
-      { enableTools: false }
-    );
+    const { token: cancelToken, cleanup } = createCancellationTokenFromState(state);
+    let llmResult;
+    try {
+      llmResult = await AIService.streamResponseDetailed(
+        [{ role: 'user', content: auditPrompt, timestamp: Date.now() }],
+        auditSystemPrompt,
+        (token) => {},
+        state.modelConfig?.modelId || coderModel || undefined,
+        state.modelConfig?.provider || undefined,
+        state.modelConfig?.temperature,
+        cancelToken,
+        { enableTools: false }
+      );
+    } finally {
+      cleanup();
+    }
 
     const reviewerOutput = llmResult.text;
     const cleanOutput = reviewerOutput.trim();
@@ -1211,16 +1575,22 @@ async function runGeneralReview(state: AgentStateType): Promise<Partial<AgentSta
     const settings = AIService.getSettings();
     const coderModel = settings.coderModel || settings.chatModel;
 
-    const llmResult = await AIService.streamResponseDetailed(
-      [{ role: 'user', content: reviewPrompt, timestamp: Date.now() }],
-      systemPrompt,
-      () => {},
-      state.modelConfig?.modelId || coderModel || undefined,
-      state.modelConfig?.provider || undefined,
-      0.2,
-      undefined,
-      { enableTools: false }
-    );
+    const { token: cancelToken, cleanup } = createCancellationTokenFromState(state);
+    let llmResult;
+    try {
+      llmResult = await AIService.streamResponseDetailed(
+        [{ role: 'user', content: reviewPrompt, timestamp: Date.now() }],
+        systemPrompt,
+        () => {},
+        state.modelConfig?.modelId || coderModel || undefined,
+        state.modelConfig?.provider || undefined,
+        0.2,
+        cancelToken,
+        { enableTools: false }
+      );
+    } finally {
+      cleanup();
+    }
 
     const reviewerOutput = llmResult.text.trim();
     if (reviewerOutput.includes('NO_REVIEW_ISSUES_FOUND')) {
@@ -1233,7 +1603,6 @@ async function runGeneralReview(state: AgentStateType): Promise<Partial<AgentSta
         content: `The general reviewer identified the following issues:\n\n${reviewerOutput}\n\nYou MUST fix these issues. Output the JSON tool call(s) to apply the fixes.`,
         timestamp: Date.now(),
       };
-
       return {
         chatHistory: [fixMessage],
         reviewCompleted: false,
@@ -1246,6 +1615,170 @@ async function runGeneralReview(state: AgentStateType): Promise<Partial<AgentSta
     state.onToken?.(`\n\n❌ **General Review Error:** ${err.message}\n`);
     return { reviewCompleted: true, reviewAttempt: attemptNum };
   }
+}
+
+function getCompileErrorFingerprint(output: string): string {
+  if (!output) return '';
+  // Extract TypeScript, npm, Python, or linter errors
+  const errRegex = /(?:error TS\d+|ERROR in|\[tsl\] ERROR|SyntaxError|AssertionError|Error:|FAIL| ❯ | ✗ )[^\n]*/g;
+  const matches = output.match(errRegex);
+  if (matches && matches.length > 0) {
+    return matches.map(m => m.trim().replace(/\s+/g, ' ')).join('|');
+  }
+  return output.substring(0, 500).replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * Helper to compute a normalized tool call fingerprint for loop detection.
+ */
+function getToolCallFingerprint(call: ToolCall): string {
+  const name = call.name;
+  if (name === 'edit_file') {
+    const filePath = call.arguments?.file_path || '';
+    const targetContent = call.arguments?.target_content || '';
+    const replacementContent = call.arguments?.replacement_content || '';
+    // Normalize all whitespace/newlines
+    const normTarget = targetContent.replace(/\s+/g, ' ').trim();
+    const normReplacement = replacementContent.replace(/\s+/g, ' ').trim();
+    return `edit_file|${filePath}|${normTarget}|${normReplacement}`;
+  }
+  // For other tools, sort keys to be deterministic and normalize whitespace in string values
+  const sortedArgs: Record<string, any> = {};
+  if (call.arguments && typeof call.arguments === 'object') {
+    for (const key of Object.keys(call.arguments).sort()) {
+      const val = call.arguments[key];
+      sortedArgs[key] = typeof val === 'string' ? val.replace(/\s+/g, ' ').trim() : val;
+    }
+  }
+  return `${name}|${JSON.stringify(sortedArgs)}`;
+}
+
+/**
+ * General-purpose loop detector that catches ALL types of agent repetition:
+ * 1. Same tool call with same arguments repeated 3+ times
+ * 2. Same file read 4+ times in recent history
+ * 3. Same file written/edited 3+ times (regardless of compile status)
+ * 4. Any single tool name called 6+ times in recent turns
+ * Returns a human-readable reason string if a loop is detected, null otherwise.
+ */
+function detectAgentLoop(chatHistory: ChatMessage[]): string | null {
+  // Only look at the last 20 messages to keep detection fast and focused on recent activity
+  const recentMessages = chatHistory.slice(-20);
+
+  // Collect all tool calls from recent tool_result messages
+  const fileReadCounts: Record<string, number> = {};
+  const fileWriteCounts: Record<string, number> = {};
+  const toolNameCounts: Record<string, number> = {};
+
+  const pathRegex = /Success: (?:Edited file:|Wrote to file:|Patched lines .*? in file:)\s*([^\s\n]+)/i;
+  // Match tool_result blocks: <tool_result name="tool_name"> ... </tool_result>
+  const toolResultRegex = /<tool_result name="([^"]+)">/g;
+
+  for (const msg of recentMessages) {
+    if (msg.role !== 'user') continue;
+
+    // Parse tool results
+    let match;
+    toolResultRegex.lastIndex = 0;
+    while ((match = toolResultRegex.exec(msg.content)) !== null) {
+      const toolName = match[1];
+      toolNameCounts[toolName] = (toolNameCounts[toolName] || 0) + 1;
+    }
+
+    // Track file reads
+    if (msg.content.includes('<tool_result name="read_file">')) {
+      const readPathMatch = msg.content.match(/<tool_result name="read_file">\n([\s\S]*?)<\/tool_result>/);
+      if (readPathMatch) {
+        const contentHash = readPathMatch[1].substring(0, 200);  // First 200 chars as a fingerprint
+        fileReadCounts[contentHash] = (fileReadCounts[contentHash] || 0) + 1;
+      }
+    }
+
+    // Track file writes/edits via the Success: prefix
+    const writeMatch = msg.content.match(pathRegex);
+    if (writeMatch) {
+      const filePath = path.normalize(writeMatch[1]);
+      fileWriteCounts[filePath] = (fileWriteCounts[filePath] || 0) + 1;
+    }
+  }
+
+  // Also scan assistant messages for repeated identical tool calls using ToolManager parser
+  const assistantToolCalls: ToolCall[] = [];
+  for (const msg of recentMessages) {
+    if (msg.role !== 'assistant') continue;
+    try {
+      const parsed = ToolManager.parseToolCalls(msg.content);
+      if (parsed && parsed.length > 0) {
+        assistantToolCalls.push(...parsed);
+      }
+    } catch {
+      // Ignore parsing errors here
+    }
+  }
+
+  const assistantFingerprints = assistantToolCalls.map(getToolCallFingerprint);
+
+  // 1. Check for consecutive identical/near-identical tool calls of ANY tool
+  if (assistantFingerprints.length >= 3) {
+    const last = assistantFingerprints[assistantFingerprints.length - 1];
+    let count = 0;
+    for (let i = assistantFingerprints.length - 1; i >= 0; i--) {
+      if (assistantFingerprints[i] === last) count++;
+      else break;
+    }
+    if (count >= 3) {
+      const toolName = last.split('|')[0];
+      return `Repeated identical/near-identical \`${toolName}\` call ${count} times consecutively`;
+    }
+  }
+
+  // 2. Check for same editing/writing tool call anywhere in recent history (even if interspersed)
+  const editTools = ['edit_file', 'write_file', 'patch_file_lines', 'insert_file_lines', 'run_speculative_patch'];
+  const fingerprintCounts: Record<string, number> = {};
+  for (const fp of assistantFingerprints) {
+    fingerprintCounts[fp] = (fingerprintCounts[fp] || 0) + 1;
+    const toolName = fp.split('|')[0];
+    if (editTools.includes(toolName) && fingerprintCounts[fp] >= 3) {
+      return `Repeated editing/writing \`${toolName}\` call ${fingerprintCounts[fp]} times in recent history with near-identical arguments`;
+    }
+  }
+
+  // Check for same file read too many times
+  for (const [key, count] of Object.entries(fileReadCounts)) {
+    if (count >= 4) {
+      return `Same file read ${count} times in recent history`;
+    }
+  }
+
+  // Check for same file written/edited too many times
+  for (const [filePath, count] of Object.entries(fileWriteCounts)) {
+    if (count >= 3) {
+      return `File \`${filePath}\` written/edited ${count} times in recent history`;
+    }
+  }
+
+  // Check for any single tool called too many times
+  for (const [toolName, count] of Object.entries(toolNameCounts)) {
+    const isMcp = toolName.startsWith('mcp__');
+    const isReadOnly = [
+      'read_file', 'list_dir', 'grep_search', 'web_search', 'fetch_webpage', 'web_scrape',
+      'get_library_docs', 'get_diagnostics', 'get_active_editor_context', 'search_workspace_symbols',
+      'find_references', 'find_definitions', 'get_vscode_extensions', 'get_vscode_settings'
+    ].includes(toolName);
+    const isCommand = toolName === 'run_command';
+
+    if (isMcp || isReadOnly || isCommand) {
+      if (count >= 20) {
+        return `Tool \`${toolName}\` called ${count} times in recent turns`;
+      }
+    } else {
+      if (count >= 8) {
+        return `Tool \`${toolName}\` called ${count} times in recent turns`;
+      }
+    }
+  }
+
+  return null;
 }
 
 function routeToFinalizeOrAudit(state: AgentStateType): string {
@@ -1299,7 +1832,11 @@ function findTaskFile(dir: string, depth = 0): string | null {
 }
 
 function extractInitialUserPrompt(chatHistory: ChatMessage[]): string {
-  const fullUserContent = chatHistory.find(m => m.role === 'user')?.content || '';
+  let humanMsg = [...chatHistory].reverse().find(m => m.role === 'user' && m.content.includes('User Request:\n'));
+  if (!humanMsg) {
+    humanMsg = [...chatHistory].reverse().find(m => m.role === 'user');
+  }
+  const fullUserContent = humanMsg ? humanMsg.content : '';
   const userRequestMatch = fullUserContent.match(/User Request:\n([\s\S]*)$/);
   return userRequestMatch ? userRequestMatch[1] : fullUserContent;
 }
@@ -1401,16 +1938,22 @@ Rules:
       if (learningsPrompt) plannerSystemPrompt = plannerSystemPrompt + '\n\n' + learningsPrompt;
     } catch {}
 
-    const llmResult = await AIService.streamResponseDetailed(
-      [{ role: 'user', content: `User request:\n${prompt}`, timestamp: Date.now() }],
-      plannerSystemPrompt,
-      () => {},
-      plannerModel,
-      provider,
-      0.2,
-      undefined,
-      { enableTools: false }
-    );
+    const { token: cancelToken, cleanup } = createCancellationTokenFromState(state);
+    let llmResult;
+    try {
+      llmResult = await AIService.streamResponseDetailed(
+        [{ role: 'user', content: `User request:\n${prompt}`, timestamp: Date.now() }],
+        plannerSystemPrompt,
+        () => {},
+        plannerModel,
+        provider,
+        0.2,
+        cancelToken,
+        { enableTools: false }
+      );
+    } finally {
+      cleanup();
+    }
 
     const rawText = ToolManager.stripReasoningFromText(llmResult.text || '');
     const match = rawText.match(/\{[\s\S]*\}/);
@@ -1479,13 +2022,20 @@ Rules:
 
 export function routeAfterParse(state: AgentStateType): string {
   if (!state.isRunning) return 'finalize';
+
+  // ── General loop detection ────────────────────────────────────────────
+  const loopReason = detectAgentLoop(state.chatHistory);
+  if (loopReason) {
+    state.onToken?.(`\n\n⚠️ **Agent loop detected: ${loopReason}. Stopping to prevent token drain.**\n`);
+    return 'summarizeAndAskUser';
+  }
+
+  // ── Tool calls pending → execute them ─────────────────────────────────
   if (state.pendingToolCalls && state.pendingToolCalls.length > 0) {
     return 'executeTools';
   }
 
-  // Self-heal: If we're awaiting a self-heal response and got text-only (no tool calls),
-  // check what to do — either re-verify the compile/test or, if the model keeps responding
-  // with prose instead of a `tool_call`, force a summarize-and-ask handoff.
+  // ── Self-heal: awaiting fix response ──────────────────────────────────
   if (state.awaitingSelfHealResponse) {
     if (state.consecutiveTextOnlyHealResponses >= 3) {
       return 'summarizeAndAskUser';
@@ -1493,40 +2043,23 @@ export function routeAfterParse(state: AgentStateType): string {
     return 'checkSelfHeal';
   }
 
-  // Reprompt for tool execution ONLY if there is real evidence that tool calls were
-  // expected: either prior tool calls were attempted and failed, or the user prompt
-  // contains action keywords. Previously this fired unconditionally on any action verb,
-  // which forced tool calls on conversational questions like "how do I create a function?"
-  const fullUserContent = state.chatHistory.find(m => m.role === 'user')?.content || '';
-  const userRequestMatch = fullUserContent.match(/User Request:\n([\s\S]*)$/);
-  const initialUserPrompt = userRequestMatch ? userRequestMatch[1] : fullUserContent;
+  // ── Reprompt for tool execution (text-only response on action request) ─
+  const initialUserPrompt = extractInitialUserPrompt(state.chatHistory);
   const hasActionKeywords = /delete|create|fix|run|write|edit|add|remove|update|change|make|install|uninstall/i.test(initialUserPrompt);
-  // Reprompt for tool execution ONLY if we haven't made code changes yet, the user prompt
-  // expects code modifications (hasActionKeywords), and we are early in the loop (loopCount <= 3).
-  // If we have already made code changes, a text-only response from the LLM indicates it is done
-  // and summarizing/explaining the changes, so we should NOT reprompt it.
   const shouldKeepWorking = !state.codeChangesMade 
     && hasActionKeywords 
-    && (state.loopCount <= 3 || state.compileHealAttempts > 0 || state.testHealAttempts > 0);
+    && state.loopCount <= 15
+    && state.consecutiveReprompts < 2;
   if (state.loopCount < state.maxLoops && shouldKeepWorking) {
     return 'repromptToolCall';
   }
 
-  // Task list check: if there are uncompleted tasks remaining in task.md, route to continueUnfinishedTasks node
-  if (state.workspaceRoot) {
+  // ── Unfinished tasks check ────────────────────────────────────────────
+  if (state.workspaceRoot && state.continueTaskReprompts < 2) {
     const taskFilePath = findTaskFile(state.workspaceRoot);
     if (taskFilePath && fs.existsSync(taskFilePath)) {
       const taskContent = fs.readFileSync(taskFilePath, 'utf8');
       if (taskContent.includes('- [ ]')) {
-        // Guard against infinite loop: if we already reprompted the agent to continue
-        // unfinished tasks in the previous turn and it still returned text-only,
-        // terminate to avoid token exhaustion.
-        const lastMsg = state.chatHistory[state.chatHistory.length - 1];
-        const isLastMsgReprompt = lastMsg && lastMsg.role === 'user' && lastMsg.content.includes('uncompleted tasks remaining');
-        if (isLastMsgReprompt) {
-          state.onToken?.('\n\n⚠️ **Agent is stuck in a text-only loop with unfinished tasks. Finalizing to prevent token drain.**\n');
-          return routeToFinalizeOrAudit(state);
-        }
         return 'continueUnfinishedTasks';
       }
     }
@@ -1539,9 +2072,7 @@ export function routeFromSelfHeal(state: AgentStateType): string {
   if (!state.isRunning) return 'finalize';
   // Only run auto-compile/auto-test if code changes were made OR if the user explicitly asked for it
   // (We check for explicit requests by looking at the user prompt for compile/test keywords)
-  const fullUserContent = state.chatHistory.find(m => m.role === 'user')?.content || '';
-  const userRequestMatch = fullUserContent.match(/User Request:\n([\s\S]*)$/);
-  const initialUserPrompt = userRequestMatch ? userRequestMatch[1] : fullUserContent;
+  const initialUserPrompt = extractInitialUserPrompt(state.chatHistory);
   const explicitlyRequestedCompile = /compile|build/i.test(initialUserPrompt);
   const explicitlyRequestedTest = /test|spec/i.test(initialUserPrompt);
   
@@ -1557,9 +2088,7 @@ export function routeAfterCompile(state: AgentStateType): string {
   if (!state.isRunning) return 'finalize';
   if (!state.compileCompleted) return 'callLLM';
 
-  const fullUserContent = state.chatHistory.find(m => m.role === 'user')?.content || '';
-  const userRequestMatch = fullUserContent.match(/User Request:\n([\s\S]*)$/);
-  const initialUserPrompt = userRequestMatch ? userRequestMatch[1] : fullUserContent;
+  const initialUserPrompt = extractInitialUserPrompt(state.chatHistory);
   const explicitlyRequestedTest = /test|spec/i.test(initialUserPrompt);
 
   const shouldTest = state.autoTest && !state.testCompleted && (state.codeChangesMade || explicitlyRequestedTest);
@@ -1576,7 +2105,7 @@ export function routeAfterTest(state: AgentStateType): string {
 export function routeAfterAudit(state: AgentStateType): string {
   if (!state.isRunning) return 'finalize';
   if (!state.auditCompleted) return 'callLLM';
-  return 'finalize';
+  return routeToFinalizeOrAudit(state);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -1620,7 +2149,7 @@ async function checkSelfHeal(state: AgentStateType): Promise<Partial<AgentStateT
 
   if (!looksLikeToolCall) {
     const nextCount = state.consecutiveTextOnlyHealResponses + 1;
-    state.onToken?.(`\n\n🤖 Self-heal text-only response (${nextCount}/2). Re-prompting.\n`);
+    state.onToken?.(`\n\n🤖 Self-heal text-only response (${nextCount}/3). Re-prompting.\n`);
     const repromptMsg: ChatMessage = {
       role: 'user',
       content: `You responded with prose to the previous fix prompt, but the build is still failing. You MUST emit the actual JSON tool call now to fix the error — {\"name\": \"edit_file\", \"arguments\": {...}} or an array of such calls. Do NOT explain in markdown code blocks. Do NOT describe what you would do. Output the raw JSON tool_call now.
@@ -1662,19 +2191,28 @@ async function summarizeAndAskUser(state: AgentStateType): Promise<Partial<Agent
 }
 
 async function repromptToolCall(state: AgentStateType): Promise<Partial<AgentStateType>> {
-  state.onToken?.('\n\n🤖 Self-heal plan detected. Prompting for tool execution.\n');
+  const nextCount = (state.consecutiveReprompts || 0) + 1;
+  state.onToken?.(`\n\n🤖 Reprompting for tool execution (${nextCount}/2)...\n`);
+  
+  let repromptText = `You responded with text only, but the request requires action. You MUST output the actual JSON tool call now to execute the changes — {"name": "edit_file", "arguments": {...}} or an array of such calls. Do not explain, do not output markdown code blocks. Output ONLY the tool calls.`;
+  if (state.lastParserError) {
+    repromptText = `Your last response failed to parse as a valid JSON tool call:\n\n${state.lastParserError}\n\nPlease correct the syntax/structure and output the valid JSON tool call now. Do not explain, do not output markdown code blocks. Output ONLY the tool calls.`;
+  }
+
   const repromptMsg: ChatMessage = {
     role: 'user',
-    content: `You responded with text only, but the request requires action. You MUST output the actual JSON tool call now to execute the changes — {"name": "edit_file", "arguments": {...}} or an array of such calls. Do not explain, do not output markdown code blocks. Output ONLY the tool calls.`,
+    content: repromptText,
     timestamp: Date.now()
   };
   return {
     chatHistory: [repromptMsg],
+    consecutiveReprompts: nextCount,
   };
 }
 
 async function continueUnfinishedTasks(state: AgentStateType): Promise<Partial<AgentStateType>> {
-  state.onToken?.('\n\n🤖 Unfinished tasks found. Continuing...\n');
+  const nextCount = (state.continueTaskReprompts || 0) + 1;
+  state.onToken?.(`\n\n🤖 Unfinished tasks found. Continuing (${nextCount}/2)...\n`);
   const repromptMsg: ChatMessage = {
     role: 'user',
     content: `You have uncompleted tasks remaining in your task list (task.md). Please continue implementing the remaining files and tasks in your plan. Output the actual JSON tool calls now to execute the changes — {"name": "edit_file", "arguments": {...}} or an array of such calls.`,
@@ -1682,6 +2220,7 @@ async function continueUnfinishedTasks(state: AgentStateType): Promise<Partial<A
   };
   return {
     chatHistory: [repromptMsg],
+    continueTaskReprompts: nextCount,
   };
 }
 
@@ -1752,6 +2291,7 @@ export function createAgentGraph() {
       finalize: 'finalize',
       continueUnfinishedTasks: 'continueUnfinishedTasks',
       runSecurityAudit: 'runSecurityAudit',
+      runGeneralReview: 'runGeneralReview',
     })
 
     .addEdge('summarizeAndAskUser', 'finalize')
@@ -1764,6 +2304,7 @@ export function createAgentGraph() {
       runCompile: 'runCompile',
       runTest: 'runTest',
       runSecurityAudit: 'runSecurityAudit',
+      runGeneralReview: 'runGeneralReview',
       finalize: 'finalize',
     })
 

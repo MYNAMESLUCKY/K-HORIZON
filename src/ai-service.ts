@@ -63,10 +63,13 @@ export class ModelCapabilities {
   }
 
   static supportsNativeTools(modelId: string | undefined, provider: string | undefined): boolean {
-    if (!modelId) return ToolManager.providerSupportsNativeTools(provider);
+    if (!modelId) return false;
     const m = modelId.toLowerCase();
-    if (this.NATIVE_TOOL_MODEL_HINTS.some(h => m.includes(h.toLowerCase()))) return true;
-    return ToolManager.providerSupportsNativeTools(provider);
+    const p = (provider || '').toLowerCase();
+    if (!['openai', 'anthropic', 'gemini', 'openrouter', 'custom', 'ollama'].includes(p)) {
+      return false;
+    }
+    return this.NATIVE_TOOL_MODEL_HINTS.some(h => m.includes(h.toLowerCase()));
   }
 }
 
@@ -107,6 +110,32 @@ export function splitReasoningFromText(text: string): { text: string; reasoning:
 }
 
 export class AIService {
+  private static getGeminiRequestInfo(baseURL: string, apiKey: string): {
+    url: string;
+    isNativeGemini: boolean;
+    authHeader?: string;
+  } {
+    const geminiBase = baseURL || 'https://generativelanguage.googleapis.com/v1beta';
+    let url = this.normalizeURL(geminiBase, 'Gemini');
+    const isNativeGemini = url.includes('generativelanguage.googleapis.com') && !url.includes('/openai/');
+    if (isNativeGemini) {
+      url = url.includes('?key=') ? url : `${url}?key=${apiKey}`;
+      return { url, isNativeGemini };
+    }
+    return {
+      url,
+      isNativeGemini,
+      authHeader: apiKey ? `Bearer ${apiKey}` : undefined,
+    };
+  }
+
+  private static formatGeminiModelForEndpoint(model: string, isNativeGemini: boolean): string {
+    if (!isNativeGemini) {
+      return model;
+    }
+    return model.includes('/') ? model : `models/${model}`;
+  }
+
   public static getSettings(): Settings {
     const config = vscode.workspace.getConfiguration('k-horizon');
     return {
@@ -123,6 +152,26 @@ export class AIService {
       systemPrompt: config.get('systemPrompt') || '',
       customModels: config.get('customModels') || [],
     };
+  }
+
+  public static async getMaxContextTokens(): Promise<number> {
+    const settings = this.getSettings();
+    if (settings.provider === 'Copilot' && typeof vscode !== 'undefined' && vscode.lm && typeof vscode.lm.selectChatModels === 'function') {
+      try {
+        const models = await vscode.lm.selectChatModels({ vendor: 'copilot', family: settings.chatModel });
+        const chatModelToUse = models[0] || (await vscode.lm.selectChatModels({ vendor: 'copilot' }))[0];
+        if (chatModelToUse && typeof chatModelToUse.maxInputTokens === 'number') {
+          // Cap Copilot models at a safe maximum input context size of 9000 tokens (budget ~8100)
+          // to prevent internal Copilot backend rejects even if the model itself claims a larger window.
+          const maxTokens = Math.min(9000, chatModelToUse.maxInputTokens);
+          return Math.max(4000, Math.floor(maxTokens * 0.9));
+        }
+      } catch (e) {
+        console.error("Error fetching Copilot maxInputTokens:", e);
+      }
+    }
+    // Fall back to settings or default
+    return settings.maxContextTokens || 131000;
   }
 
   /**
@@ -222,7 +271,7 @@ export class AIService {
       }
     }
 
-    const basePrompt = settings.systemPrompt || systemInstruction;
+    let basePrompt = settings.systemPrompt || systemInstruction;
 
     if (provider === 'Copilot') {
       let chatModelToUse: vscode.LanguageModelChat | undefined;
@@ -258,33 +307,246 @@ export class AIService {
       }
 
       const lmMessages: vscode.LanguageModelChatMessage[] = [];
-      if (basePrompt) {
-        lmMessages.push(vscode.LanguageModelChatMessage.User(basePrompt));
-      }
+
+      // Build a flat list of {role, content} pairs, prepending the system
+      // instruction into the content of the first user message (or as a
+      // stand-alone user message if the history begins with an assistant turn).
+      // This avoids back-to-back User messages which the VSCode LM API
+      // rejects with "model output must contain either output text or tool calls".
+      const rawPairs: Array<{ role: 'user' | 'assistant'; content: string }> = [];
       for (const m of messages) {
-        if (m.role === 'assistant') {
-          lmMessages.push(vscode.LanguageModelChatMessage.Assistant(m.content));
-        } else if (m.role === 'user') {
-          lmMessages.push(vscode.LanguageModelChatMessage.User(m.content));
+        if (m.role === 'assistant' || m.role === 'user') {
+          rawPairs.push({ role: m.role, content: m.content });
+        }
+        // 'system' messages are folded into the system instruction already
+      }
+
+      // Coalesce consecutive messages of the same role by joining their content.
+      // This is necessary because tool_result blocks are appended as user messages,
+      // and some turns may produce multiple user messages in a row.
+      const coalesced: Array<{ role: 'user' | 'assistant'; content: string }> = [];
+      for (const pair of rawPairs) {
+        if (coalesced.length > 0 && coalesced[coalesced.length - 1].role === pair.role) {
+          coalesced[coalesced.length - 1].content += '\n' + pair.content;
+        } else {
+          coalesced.push({ ...pair });
         }
       }
 
-      const cts = new vscode.CancellationTokenSource();
-      const response = await chatModelToUse.sendRequest(lmMessages, {}, cts.token);
+      // ── Context Pruning for Copilot Token Limits ───────────────────────────
+      let maxInputTokens = 8192;
+      if (chatModelToUse && typeof chatModelToUse.maxInputTokens === 'number') {
+        maxInputTokens = Math.min(9000, chatModelToUse.maxInputTokens);
+      }
+      const targetBudget = Math.floor(maxInputTokens * 0.9);
 
-      // The Copilot LM API interleaves reasoning and visible text in a single
-      // `response.text` stream for thinking-capable models. We split after the
-      // fact via `splitReasoningFromText`, which strips `<think>…</think>` and
-      // `<reasoning>…</reasoning>` blocks out of the visible channel. Without
-      // this pass, chain-of-thought leaks to the user and into chatHistory.
+      const getEstimatedTotalTokens = (promptStr: string, msgList: Array<{ role: 'user' | 'assistant'; content: string }>): number => {
+        let total = Math.ceil(promptStr.length / 2.5);
+        for (const msg of msgList) {
+          total += Math.ceil(msg.content.length / 2.5);
+        }
+        return total;
+      };
+
+      let activePrompt = basePrompt || '';
+
+      if (getEstimatedTotalTokens(activePrompt, coalesced) > targetBudget) {
+        // Step 1: Remove Repository Map (usually the largest section)
+        if (activePrompt.includes('## Codebase Repository Map')) {
+          const lines = activePrompt.split('\n');
+          const newLines: string[] = [];
+          let skip = false;
+          for (const line of lines) {
+            if (line.trim().startsWith('## Codebase Repository Map')) {
+              skip = true;
+              continue;
+            }
+            if (skip && line.trim().startsWith('## ')) {
+              skip = false;
+            }
+            if (!skip) {
+              newLines.push(line);
+            }
+          }
+          activePrompt = newLines.join('\n');
+        }
+      }
+
+      if (getEstimatedTotalTokens(activePrompt, coalesced) > targetBudget) {
+        // Step 2: Remove Gold-Standard Exemplar
+        if (activePrompt.includes('## Gold-Standard Exemplar')) {
+          const lines = activePrompt.split('\n');
+          const newLines: string[] = [];
+          let skip = false;
+          for (const line of lines) {
+            if (line.trim().startsWith('## Gold-Standard Exemplar')) {
+              skip = true;
+              continue;
+            }
+            if (skip && line.trim().startsWith('## ')) {
+              skip = false;
+            }
+            if (!skip) {
+              newLines.push(line);
+            }
+          }
+          activePrompt = newLines.join('\n');
+        }
+      }
+
+      if (getEstimatedTotalTokens(activePrompt, coalesced) > targetBudget) {
+        // Step 3: Remove Retrieved Expert Skills
+        const skillsHeaders = ['## Retrieved Expert Skills', '## Retrieved RAG Skills', '## Specialist RAG Skills'];
+        for (const header of skillsHeaders) {
+          if (activePrompt.includes(header)) {
+            const lines = activePrompt.split('\n');
+            const newLines: string[] = [];
+            let skip = false;
+            for (const line of lines) {
+              if (line.trim().startsWith(header)) {
+                skip = true;
+                continue;
+              }
+              if (skip && line.trim().startsWith('## ')) {
+                skip = false;
+              }
+              if (!skip) {
+                newLines.push(line);
+              }
+            }
+            activePrompt = newLines.join('\n');
+            break;
+          }
+        }
+      }
+
+      if (getEstimatedTotalTokens(activePrompt, coalesced) > targetBudget) {
+        // Step 4: Drop oldest history messages (by pairs to maintain turn structure)
+        while (coalesced.length > 2 && getEstimatedTotalTokens(activePrompt, coalesced) > targetBudget) {
+          coalesced.splice(0, 2);
+        }
+      }
+
+      if (getEstimatedTotalTokens(activePrompt, coalesced) > targetBudget) {
+        // Step 5: Truncate the last user message
+        const lastMsg = coalesced[coalesced.length - 1];
+        if (lastMsg && lastMsg.role === 'user') {
+          const promptTokens = Math.ceil(activePrompt.length / 2.5);
+          let otherTokens = 0;
+          for (let i = 0; i < coalesced.length - 1; i++) {
+            otherTokens += Math.ceil(coalesced[i].content.length / 2.5);
+          }
+          const available = targetBudget - promptTokens - otherTokens;
+          const allowedTokensForLastMsg = Math.max(1000, available);
+          const maxChars = allowedTokensForLastMsg * 2.5;
+          if (lastMsg.content.length > maxChars) {
+            lastMsg.content = lastMsg.content.substring(0, maxChars) + '\n\n... [Truncated due to token limit]';
+          }
+        }
+      }
+
+      basePrompt = activePrompt;
+
+      // Inject the system instruction into the first user message so we don't
+      // create an extra standalone User turn at the top.
+      if (basePrompt && basePrompt.trim() !== '') {
+        if (coalesced.length > 0 && coalesced[0].role === 'user') {
+          coalesced[0].content = basePrompt + '\n\n' + coalesced[0].content;
+        } else {
+          coalesced.unshift({ role: 'user', content: basePrompt });
+        }
+      }
+
+      for (const pair of coalesced) {
+        if (pair.role === 'assistant') {
+          lmMessages.push(vscode.LanguageModelChatMessage.Assistant(pair.content));
+        } else {
+          lmMessages.push(vscode.LanguageModelChatMessage.User(pair.content));
+        }
+      }
+
+      // Ensure the conversation ends with a User message (required by Copilot API).
+      // Check using the coalesced array instead of inspecting vscode objects.
+      if (coalesced.length === 0 || coalesced[coalesced.length - 1].role === 'assistant') {
+        lmMessages.push(vscode.LanguageModelChatMessage.User('Please continue.'));
+      }
+
+      const cts = new vscode.CancellationTokenSource();
+      const runAttempt = async (msgs: vscode.LanguageModelChatMessage[]): Promise<string> => {
+        const res = await chatModelToUse.sendRequest(msgs, {}, cts.token);
+        let accumulated = '';
+        for await (const chunk of res.text) {
+          accumulated += chunk;
+          if (options.exposeReasoning) {
+            onToken(chunk);
+          }
+        }
+        return accumulated;
+      };
+
       let accumulatedText = '';
-      for await (const chunk of response.text) {
-        accumulatedText += chunk;
-        if (options.exposeReasoning) {
-          // Best-effort: pass the raw chunk through. Splitting happens once at
-          // the end so we don't risk emitting a partial `<think>` token as
-          // visible text and confusing the user mid-stream.
-          onToken(chunk);
+      try {
+        accumulatedText = await runAttempt(lmMessages);
+      } catch (copilotErr: any) {
+        console.warn("[K-Horizon] Copilot first sendRequest/stream failed, attempting recovery paths:", copilotErr);
+        const isTokenLimit = String(copilotErr.message || '').toLowerCase().includes('token') ||
+                             String(copilotErr.message || '').toLowerCase().includes('limit');
+        
+        let fallbackPrompt = basePrompt || '';
+        if (isTokenLimit || fallbackPrompt.length > 5000) {
+          // Strip codebase map, exemplar, and skills
+          const cleanLines: string[] = [];
+          let skip = false;
+          for (const line of fallbackPrompt.split('\n')) {
+            if (line.trim().startsWith('## Codebase Repository Map') ||
+                line.trim().startsWith('## Gold-Standard Exemplar') ||
+                line.trim().startsWith('## Retrieved Expert Skills') ||
+                line.trim().startsWith('## Retrieved RAG Skills') ||
+                line.trim().startsWith('## Specialist RAG Skills')) {
+              skip = true;
+              continue;
+            }
+            if (skip && line.trim().startsWith('## ')) {
+              skip = false;
+            }
+            if (!skip) {
+              cleanLines.push(line);
+            }
+          }
+          fallbackPrompt = cleanLines.join('\n');
+        }
+
+        let lastUserContent = coalesced.filter(p => p.role === 'user').pop()?.content || 'Please respond.';
+        if (lastUserContent.length > 8000) {
+          lastUserContent = lastUserContent.substring(0, 8000) + '\n\n... [Truncated for Copilot API token limit]';
+        }
+        
+        const fallbackMessages: vscode.LanguageModelChatMessage[] = [];
+        if (fallbackPrompt && fallbackPrompt.trim() !== '') {
+          // If system instructions are still very long, truncate them to a safe length
+          let safeSystemPrompt = fallbackPrompt;
+          if (safeSystemPrompt.length > 8000) {
+            safeSystemPrompt = safeSystemPrompt.substring(0, 8000) + '\n\n... [Truncated for Copilot API token limit]';
+          }
+          fallbackMessages.push(vscode.LanguageModelChatMessage.User(safeSystemPrompt));
+        }
+        fallbackMessages.push(vscode.LanguageModelChatMessage.User(lastUserContent));
+        
+        try {
+          accumulatedText = await runAttempt(fallbackMessages);
+        } catch (retryErr: any) {
+          console.warn("[K-Horizon] Copilot fallback sendRequest/stream failed, attempting final fallback:", retryErr);
+          try {
+            // Last-resort fallback: send only the user's message with no system instructions, truncated to be absolutely safe
+            let finalUserContent = lastUserContent;
+            if (finalUserContent.length > 6000) {
+              finalUserContent = finalUserContent.substring(0, 6000) + '\n\n... [Truncated for Copilot API token limit]';
+            }
+            const finalFallback = [vscode.LanguageModelChatMessage.User(finalUserContent)];
+            accumulatedText = await runAttempt(finalFallback);
+          } catch (lastErr: any) {
+            throw new Error(`Copilot API rejected request: ${lastErr.message || lastErr}`);
+          }
         }
       }
       const { text: visibleText, reasoning } = splitReasoningFromText(accumulatedText);
@@ -312,17 +574,11 @@ export class AIService {
 
     switch (provider) {
       case 'Gemini':
-        const geminiBase = baseURL || 'https://generativelanguage.googleapis.com/v1beta';
-        url = this.normalizeURL(geminiBase, 'Gemini');
-        // Detect if the URL is the native Gemini endpoint (uses ?key=) or the OpenAI-compatible one
-        const isNativeGemini = url.includes('generativelanguage.googleapis.com') && !url.includes('/openai/');
-        if (isNativeGemini) {
-          url = url.includes('?key=') ? url : `${url}?key=${apiKey}`;
-        } else if (apiKey) {
-          headers['Authorization'] = `Bearer ${apiKey}`;
-        }
+        const geminiInfo = this.getGeminiRequestInfo(baseURL, apiKey);
+        url = geminiInfo.url;
+        if (geminiInfo.authHeader) headers['Authorization'] = geminiInfo.authHeader;
         body = {
-          model: model.includes('/') ? model : `models/${model}`,
+          model: this.formatGeminiModelForEndpoint(model, geminiInfo.isNativeGemini),
           messages: apiMessages,
           max_tokens: 16384,
           stream: true
@@ -453,9 +709,29 @@ export class AIService {
       body.temperature = tempOverride;
     }
 
+    if (ModelCapabilities.supportsReasoning(model, provider)) {
+      // OpenAI and Anthropic reasoning/thinking models reject non-default temperature parameters (400 Bad Request)
+      delete body.temperature;
+    }
+
+    // Native tool calling is now wired into ALL supported providers. The model
+    // receives a typed `tools` array and returns structured `tool_calls` in its
+    // streaming response; this eliminates the brittle text-parser fallback that
+    // was the root cause of "agent can't use tools properly" symptoms.
+    //
+    // Provider-specific shapes:
+    //   - Anthropic: body.tools (input_schema), tool_use SSE blocks
+    //   - OpenAI / OpenAI-compat (OpenAI, OpenRouter, Custom, Ollama): body.tools (JSON schema), tool_calls SSE deltas
+    //   - Gemini (OpenAI-compat endpoint): same as OpenAI
+    //   - Gemini (native Vertex/AI Studio endpoint via getGeminiRequestInfo): tools field with function_declarations
+    //
+    // The model-capability gate is intentionally permissive: if a provider has
+    // no native tool support we fall back to the JSON-text parser in
+    // ToolManager.parseToolCalls.
     const useNativeTools = options.enableTools && ModelCapabilities.supportsNativeTools(model, provider);
     if (useNativeTools) {
-      if (provider === 'Anthropic') {
+      const isAnthropic = provider === 'Anthropic';
+      if (isAnthropic) {
         body.tools = ToolManager.getNativeToolDefinitions('anthropic');
         body.tool_choice = { type: 'auto' };
         // Enable extended thinking on Claude 3.7+/4 when the model id suggests
@@ -469,6 +745,7 @@ export class AIService {
           body.max_tokens = Math.max(body.max_tokens || 8192, thinkingBudget + 4096);
         }
       } else {
+        // OpenAI / OpenAI-compat / Gemini / Ollama / Custom
         body.tools = ToolManager.getNativeToolDefinitions('openai');
         body.tool_choice = 'auto';
         // OpenAI o-series / gpt-5 use `reasoning_effort` instead of (or in
@@ -478,6 +755,19 @@ export class AIService {
           // the caller already pinned a temperature we assume they want
           // minimal reasoning (a fast deterministic answer).
           body.reasoning_effort = 'medium';
+        }
+        // Gemini's native Vertex/AI Studio endpoint expects `tools` as
+        // `[{ function_declarations: [...] }]` rather than the OpenAI shape.
+        // Detect that and remap once.
+        if (provider === 'Gemini' && this.getGeminiRequestInfo(baseURL, apiKey).isNativeGemini) {
+          const defs = ToolManager.getNativeToolDefinitions('openai');
+          body.tools = [{
+            function_declarations: defs.map((d: any) => ({
+              name: d.function.name,
+              description: d.function.description,
+              parameters: d.function.parameters,
+            })),
+          }];
         }
       }
     }
@@ -506,6 +796,24 @@ export class AIService {
 
         if (!response.ok) {
           const errText = await response.text();
+          // Provide rich diagnostics for common errors
+          if (response.status === 404) {
+            throw new Error(
+              `HTTP 404 – The API endpoint was not found.\n` +
+              `URL attempted: ${url}\n` +
+              `Provider: ${provider} | Model: ${model}\n` +
+              `\nFix: Check your K-Horizon settings – the model name or API base URL may be incorrect. ` +
+              `For Anthropic, ensure the model ID exists (e.g. claude-3-5-sonnet-20241022). ` +
+              `For Gemini, verify your API key is valid.`
+            );
+          }
+          if (response.status === 401 || response.status === 403) {
+            throw new Error(
+              `HTTP ${response.status} – Authentication failed.\n` +
+              `Provider: ${provider} | Model: ${model}\n` +
+              `Fix: Check your API key in K-Horizon settings.`
+            );
+          }
           throw new Error(`HTTP ${response.status}: ${errText || response.statusText}`);
         }
 
@@ -615,7 +923,9 @@ export class AIService {
                     anthropicToolCallParts.set(data.index || 0, {
                       id: data.content_block.id,
                       name: data.content_block.name,
-                      arguments: data.content_block.input ? JSON.stringify(data.content_block.input) : '',
+                      arguments: data.content_block.input && Object.keys(data.content_block.input).length > 0
+                        ? JSON.stringify(data.content_block.input)
+                        : '',
                     });
                   }
                   if (data.type === 'content_block_delta' && data.delta && data.delta.text) {
@@ -626,6 +936,9 @@ export class AIService {
                   if (data.type === 'content_block_delta' && data.delta?.type === 'input_json_delta') {
                     const index = data.index || 0;
                     const existing = anthropicToolCallParts.get(index) || { arguments: '' };
+                    if (existing.arguments.trim() === '{}') {
+                      existing.arguments = '';
+                    }
                     existing.arguments += data.delta.partial_json || '';
                     anthropicToolCallParts.set(index, existing);
                   }
@@ -761,7 +1074,10 @@ Rules:
 3. Match indentation, braces, and line breaks exactly.
 4. Output should be empty if no completion makes sense.`;
 
-    const userPrompt = `<PRE>\n${prefix}\n</PRE>\n<SUF>\n${suffix}\n</SUF>`;
+    // Truncate prefix and suffix to a safe context size around the cursor for autocomplete
+    const safePrefix = prefix.length > 4000 ? prefix.slice(-4000) : prefix;
+    const safeSuffix = suffix.length > 4000 ? suffix.slice(0, 4000) : suffix;
+    const userPrompt = `<PRE>\n${safePrefix}\n</PRE>\n<SUF>\n${safeSuffix}\n</SUF>`;
 
     const settings = this.getSettings();
     let provider = settings.provider;
@@ -809,14 +1125,11 @@ Rules:
 
     switch (provider) {
       case 'Gemini':
-        const geminiBase = baseURL || 'https://generativelanguage.googleapis.com/v1beta';
-        const normGemini = this.normalizeURL(geminiBase, 'Gemini');
-        url = normGemini.includes('?key=') ? normGemini : `${normGemini}?key=${apiKey}`;
-        if (apiKey) {
-          headers['Authorization'] = `Bearer ${apiKey}`;
-        }
+        const geminiInfo = this.getGeminiRequestInfo(baseURL, apiKey);
+        url = geminiInfo.url;
+        if (geminiInfo.authHeader) headers['Authorization'] = geminiInfo.authHeader;
         body = {
-          model: model.includes('/') ? model : `models/${model}`,
+          model: this.formatGeminiModelForEndpoint(model, geminiInfo.isNativeGemini),
           messages: [
             { role: 'system', content: systemPrompt },
             { role: 'user', content: userPrompt }
@@ -829,19 +1142,41 @@ Rules:
 
       case 'Ollama':
         const ollamaBase = baseURL || 'http://127.0.0.1:11434';
-        url = this.normalizeURL(ollamaBase, 'Ollama');
-        body = {
-          model: model,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt }
-          ],
-          options: {
-            num_predict: 128,
-            temperature: 0.1
-          },
-          stream: false
-        };
+        const isFimModel = model.toLowerCase().includes('coder') || model.toLowerCase().includes('fim') || model.toLowerCase().includes('deepseek');
+        const ollamaEndpoint = isFimModel ? '/api/generate' : '/api/chat';
+        
+        let ollamaUrl = ollamaBase;
+        if (ollamaUrl.endsWith('/')) ollamaUrl = ollamaUrl.slice(0, -1);
+        url = ollamaUrl.endsWith('/api/chat') || ollamaUrl.endsWith('/api/generate') 
+          ? ollamaUrl 
+          : `${ollamaUrl}${ollamaEndpoint}`;
+
+        if (url.endsWith('/api/generate')) {
+          body = {
+            model: model,
+            prompt: prefix,
+            suffix: suffix,
+            options: {
+              num_predict: 128,
+              temperature: 0.1,
+              stop: ['<fim_prefix>', '<fim_suffix>', '<fim_middle>', '<|endoftext|>', '\n\n']
+            },
+            stream: false
+          };
+        } else {
+          body = {
+            model: model,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: userPrompt }
+            ],
+            options: {
+              num_predict: 128,
+              temperature: 0.1
+            },
+            stream: false
+          };
+        }
         break;
 
       case 'OpenAI':
@@ -925,7 +1260,7 @@ Rules:
 
       let text = '';
       if (provider === 'Ollama') {
-        text = data.message?.content || '';
+        text = url.endsWith('/api/generate') ? (data.response || '') : (data.message?.content || '');
       } else if (provider === 'Anthropic') {
         text = data.content?.[0]?.text || '';
       } else {
@@ -1059,16 +1394,11 @@ Rules:
 
     switch (provider) {
       case 'Gemini':
-        const geminiBase = baseURL || 'https://generativelanguage.googleapis.com/v1beta';
-        url = this.normalizeURL(geminiBase, 'Gemini');
-        const isNativeGemini = url.includes('generativelanguage.googleapis.com') && !url.includes('/openai/');
-        if (isNativeGemini) {
-          url = url.includes('?key=') ? url : `${url}?key=${apiKey}`;
-        } else if (apiKey) {
-          headers['Authorization'] = `Bearer ${apiKey}`;
-        }
+        const geminiInfo = this.getGeminiRequestInfo(baseURL, apiKey);
+        url = geminiInfo.url;
+        if (geminiInfo.authHeader) headers['Authorization'] = geminiInfo.authHeader;
         body = {
-          model: model.includes('/') ? model : `models/${model}`,
+          model: this.formatGeminiModelForEndpoint(model, geminiInfo.isNativeGemini),
           messages: [
             {
               role: 'user',

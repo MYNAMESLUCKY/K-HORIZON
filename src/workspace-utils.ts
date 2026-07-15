@@ -19,7 +19,7 @@ export function getWorkspaceRoot(target?: string | vscode.Uri): string {
       const folder = vscode.workspace.getWorkspaceFolder(vscode.Uri.file(absolute));
       if (folder) return folder.uri.fsPath;
     }
-  } else if (target) {
+  } else if (target instanceof vscode.Uri) {
     const folder = vscode.workspace.getWorkspaceFolder(target);
     if (folder) return folder.uri.fsPath;
   }

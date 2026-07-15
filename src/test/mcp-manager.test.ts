@@ -42,15 +42,14 @@ describe('MCPManager', () => {
     MCPManager.initialize(mockContext);
     const status = MCPManager.getServersStatus();
 
-    expect(status).toHaveLength(7);
+    expect(status).toHaveLength(6);
     const names = status.map(s => s.name);
     expect(names).toContain('Memory');
     expect(names).toContain('Puppeteer');
     expect(names).toContain('Filesystem');
     expect(names).toContain('SequentialThinking');
-    expect(names).toContain('GroundedDocs');
+    expect(names).toContain('Git');
     expect(names).toContain('Context7');
-    expect(names).toContain('ProContext');
   });
 
   it('successfully completes handshake and lists tools from a running server', async () => {
@@ -308,5 +307,38 @@ describe('MCPManager', () => {
 
     status = MCPManager.getServersStatus().find(s => s.name === 'ReconnectServer');
     expect(status?.status).toBe('Connected');
+  });
+
+  it('fails starting the server and sets error status if the command does not exist on system PATH', async () => {
+    const mockGlobalState = new Map<string, any>();
+    const mockContext = {
+      globalState: {
+        get: (key: string, defaultValue: any) => mockGlobalState.has(key) ? mockGlobalState.get(key) : defaultValue,
+        update: (key: string, value: any) => {
+          mockGlobalState.set(key, value);
+          return Promise.resolve();
+        }
+      }
+    } as any;
+
+    MCPManager.initialize(mockContext);
+
+    // Mock commandExists to return false for our fake command
+    const origCommandExists = (MCPManager as any).commandExists;
+    (MCPManager as any).commandExists = (cmd: string) => cmd === 'fake-nonexistent-cmd' ? false : origCommandExists(cmd);
+
+    try {
+      await expect(MCPManager.addServer({
+        name: 'FailServer',
+        command: 'fake-nonexistent-cmd',
+        args: []
+      })).rejects.toThrow('was not found on your system PATH');
+
+      const status = MCPManager.getServersStatus().find(s => s.name === 'FailServer');
+      expect(status?.status).toBe('Error');
+      expect(status?.error).toContain('was not found on your system PATH');
+    } finally {
+      (MCPManager as any).commandExists = origCommandExists;
+    }
   });
 });
