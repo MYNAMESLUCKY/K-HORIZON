@@ -74,6 +74,11 @@ const COMMON_TOOLS = [
   'capture_page_screenshot',
   'run_speculative_workspace_patch',
   'update_dependency_graph',
+  'trace_symbol_dependency',
+  'replace_in_files',
+  'get_file_metadata',
+  'create_directory',
+  'git_diff_file',
   'request_hunk_reviews',
   'run_fuzz_test',
   'db_query',
@@ -84,6 +89,10 @@ const COMMON_TOOLS = [
   'get_vscode_settings',
   'update_vscode_settings',
   'toggle_autocomplete',
+  'sequentialthinking',
+  'sequential_thinking',
+  'SequentialThinking',
+  'call_mcp_tool',
   'mcp__*',
 ];
 
@@ -111,11 +120,10 @@ export const SUBAGENTS: SubagentProfile[] = [
       'To fetch the latest, up-to-date documentation on frontend libraries (React, Tailwind, Next, etc.), ' +
       'always query the Context7 MCP server using its "query-docs" tool.',
     toolAllowList: COMMON_TOOLS,
-    triggers: ['react', 'next', 'nextjs', 'css', 'tailwind', 'html', 'landing',
-               'page', 'ui', 'ux', 'component', 'frontend', 'hero', 'pricing',
-               'marketing', 'homepage', 'style', 'design', 'responsive',
-               'build', 'create', 'new', 'scaffold', 'init', 'setup', 'project',
-               'website', 'app', 'site', 'boilerplate', 'template', 'starter'],
+    triggers: ['react', 'next', 'nextjs', 'css', 'tailwind', 'html', 'landing page',
+               'ui', 'ux', 'component', 'frontend', 'hero section', 'pricing page',
+               'marketing page', 'homepage', 'styling', 'responsive design',
+               'website design', 'web design', 'dashboard ui', 'form design'],
     pinnedSkillIds: ['claude-frontend-design', 'claude-web-artifacts', 'stitch-react', 'openai-frontend', 'project-scaffold', 'gsap-animation', 'animejs-animation', 'shadcn-ui', 'google-fonts', 'svgrepo-icons', 'undraw-illustrations', 'daisyui-components', 'chartjs-charts'],
   },
   {
@@ -221,7 +229,8 @@ export async function dispatchSubagent(prompt: string): Promise<SubagentProfile>
   const runnerUpScore = candidates[1] ? candidates[1].score : 0;
 
   // If we have a clear, high-scoring keyword match, route immediately (fast & token-efficient)
-  if (highestScore > 0 && (highestScore - runnerUpScore > 4)) {
+  // Require a minimum absolute score AND a gap over runner-up to avoid routing on short generic words
+  if (highestScore >= 8 && (highestScore - runnerUpScore > 4)) {
     return candidates[0].sub;
   }
 

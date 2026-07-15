@@ -3,6 +3,7 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { AIService } from './ai-service';
 import { ChatMessage } from './types';
+import { DiffHandler } from './diff-handler';
 
 export interface AgentLearning {
   id: string;
@@ -180,5 +181,161 @@ If no mistakes/corrections were identified, set "hasLearning" to false. Do not i
       console.error('[AgentLearningManager] Self-reflection learning failed:', err);
     }
     return null;
+  }
+}
+
+export interface ErrorFixRecord {
+  id: string;
+  timestamp: number;
+  error: string;
+  category: 'compile' | 'test-failure';
+  files: string[];
+  diff: string;
+}
+
+export class ErrorFixMemoryManager {
+  private static getFilePath(workspaceRoot: string): string {
+    return path.join(workspaceRoot, '.k-horizon', 'error-fix-memory.json');
+  }
+
+  public static async loadMemory(workspaceRoot: string): Promise<ErrorFixRecord[]> {
+    if (!workspaceRoot) return [];
+    const filePath = this.getFilePath(workspaceRoot);
+    try {
+      if (fs.existsSync(filePath)) {
+        const content = fs.readFileSync(filePath, 'utf8');
+        return JSON.parse(content) as ErrorFixRecord[];
+      }
+    } catch (err) {
+      console.error('[ErrorFixMemoryManager] Failed to load memory:', err);
+    }
+    return [];
+  }
+
+  public static async saveFix(
+    workspaceRoot: string,
+    error: string,
+    category: 'compile' | 'test-failure',
+    files: string[],
+    diff: string
+  ): Promise<void> {
+    if (!workspaceRoot || !error.trim() || !diff.trim()) return;
+
+    const filePath = this.getFilePath(workspaceRoot);
+    try {
+      const memory = await this.loadMemory(workspaceRoot);
+      const isDuplicate = memory.some(rec => rec.error === error && rec.diff === diff);
+      if (isDuplicate) return;
+
+      const newRecord: ErrorFixRecord = {
+        id: 'fix_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now(),
+        timestamp: Date.now(),
+        error,
+        category,
+        files,
+        diff
+      };
+
+      memory.push(newRecord);
+      if (memory.length > 100) {
+        memory.shift();
+      }
+
+      const dir = path.dirname(filePath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+      fs.writeFileSync(filePath, JSON.stringify(memory, null, 2), 'utf8');
+    } catch (err) {
+      console.error('[ErrorFixMemoryManager] Failed to save fix:', err);
+    }
+  }
+
+  public static async findMatchingFixesAsPrompt(workspaceRoot: string, errorText: string): Promise<string> {
+    if (!workspaceRoot || !errorText) return '';
+    try {
+      const memory = await this.loadMemory(workspaceRoot);
+      if (memory.length === 0) return '';
+
+      const matches = this.findMatchingFixes(errorText, memory);
+      if (matches.length === 0) return '';
+
+      let prompt = '\n\n### Historical Solutions Reference (Similar Errors Resolved in this Workspace):\n';
+      matches.forEach((match, index) => {
+        prompt += `\n[Example #${index + 1}]:
+- **Error encountered:**
+\`\`\`
+${match.error}
+\`\`\`
+- **Files changed:** ${match.files.join(', ')}
+- **How it was solved (Applied Patch):**
+\`\`\`diff
+${match.diff}
+\`\`\`\n`;
+      });
+      return prompt;
+    } catch (e) {
+      return '';
+    }
+  }
+
+  private static findMatchingFixes(errorText: string, memory: ErrorFixRecord[]): ErrorFixRecord[] {
+    const errorLower = errorText.toLowerCase();
+    const tscCodeMatch = errorLower.match(/\bts\d{4}\b/);
+    const tscCode = tscCodeMatch ? tscCodeMatch[0] : null;
+
+    const scored = memory.map(rec => {
+      let score = 0;
+      const recLower = rec.error.toLowerCase();
+
+      if (tscCode && recLower.includes(tscCode)) {
+        score += 0.5;
+      }
+
+      const words1 = new Set(errorLower.split(/\s+/).map(w => w.replace(/[^a-z0-9]/g, '')).filter(w => w.length > 2));
+      const words2 = new Set(recLower.split(/\s+/).map(w => w.replace(/[^a-z0-9]/g, '')).filter(w => w.length > 2));
+      
+      let intersection = 0;
+      words1.forEach(w => {
+        if (words2.has(w)) intersection++;
+      });
+      const union = words1.size + words2.size - intersection;
+      const jaccard = union > 0 ? (intersection / union) : 0;
+      score += jaccard;
+
+      return { rec, score };
+    });
+
+    return scored
+      .filter(x => x.score > 0.35)
+      .sort((a, b) => b.score - a.score)
+      .map(x => x.rec)
+      .slice(0, 2);
+  }
+
+  public static generateDiffString(fileBackups: Record<string, string>, workspaceRoot: string): string {
+    let diffStr = '';
+    for (const [fileAbs, originalContent] of Object.entries(fileBackups)) {
+      try {
+        if (fs.existsSync(fileAbs)) {
+          const currentContent = fs.readFileSync(fileAbs, 'utf8');
+          if (currentContent !== originalContent) {
+            const relPath = path.relative(workspaceRoot, fileAbs).replace(/\\/g, '/');
+            diffStr += `--- a/${relPath}\n+++ b/${relPath}\n`;
+            
+            const diffLines = DiffHandler.generateLineDiff(originalContent, currentContent);
+            diffLines.forEach((line: any) => {
+              if (line.type === 'added') {
+                diffStr += `+ ${line.text}\n`;
+              } else if (line.type === 'removed') {
+                diffStr += `- ${line.text}\n`;
+              }
+            });
+            diffStr += '\n';
+          }
+        }
+      } catch {}
+    }
+    return diffStr.trim();
   }
 }

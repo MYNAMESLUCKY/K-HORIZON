@@ -6,6 +6,10 @@ export class AutocompleteProvider implements vscode.InlineCompletionItemProvider
   private debounceMs = 250; // Delay to wait for user to stop typing before calling LLM
   private cache = new Map<string, string>();
 
+  private lastCachedPrefix = '';
+  private lastCachedSuggestion = '';
+  private lastCachedUri = '';
+
   public async provideInlineCompletionItems(
     document: vscode.TextDocument,
     position: vscode.Position,
@@ -17,6 +21,30 @@ export class AutocompleteProvider implements vscode.InlineCompletionItemProvider
     const settings = AIService.getSettings();
     if (!settings.enableAutocomplete) {
       return [];
+    }
+
+    const offset = document.offsetAt(position);
+    const docText = document.getText();
+
+    // Token-efficient context slicing
+    // Grabbing last 4000 chars of prefix (approx 80-100 lines) and 1500 chars of suffix (approx 30 lines)
+    const prefix = docText.substring(Math.max(0, offset - 4000), offset);
+    const suffix = docText.substring(offset, Math.min(docText.length, offset + 1500));
+
+    // Client-side prefix-matching optimization
+    if (
+      this.lastCachedUri === document.uri.fsPath &&
+      this.lastCachedSuggestion &&
+      prefix.startsWith(this.lastCachedPrefix)
+    ) {
+      const typed = prefix.substring(this.lastCachedPrefix.length);
+      if (this.lastCachedSuggestion.startsWith(typed)) {
+        const remaining = this.lastCachedSuggestion.substring(typed.length);
+        if (remaining) {
+          const range = new vscode.Range(position, position);
+          return [new vscode.InlineCompletionItem(remaining, range)];
+        }
+      }
     }
 
     // Check if the trigger is normal typing (avoid triggering on imports or edits if unwanted)
@@ -33,14 +61,6 @@ export class AutocompleteProvider implements vscode.InlineCompletionItemProvider
       }
     }
 
-    const offset = document.offsetAt(position);
-    const docText = document.getText();
-
-    // Token-efficient context slicing
-    // Grabbing last 4000 chars of prefix (approx 80-100 lines) and 1500 chars of suffix (approx 30 lines)
-    const prefix = docText.substring(Math.max(0, offset - 4000), offset);
-    const suffix = docText.substring(offset, Math.min(docText.length, offset + 1500));
-
     // Avoid calling LLM for empty files or when at trailing whitespace at the very start
     if (prefix.trim() === '' && suffix.trim() === '') {
       return [];
@@ -51,6 +71,10 @@ export class AutocompleteProvider implements vscode.InlineCompletionItemProvider
     if (this.cache.has(cacheKey)) {
       const cachedText = this.cache.get(cacheKey)!;
       if (cachedText) {
+        this.lastCachedPrefix = prefix;
+        this.lastCachedSuggestion = cachedText;
+        this.lastCachedUri = document.uri.fsPath;
+
         const range = new vscode.Range(position, position);
         return [new vscode.InlineCompletionItem(cachedText, range)];
       }
@@ -74,6 +98,11 @@ export class AutocompleteProvider implements vscode.InlineCompletionItemProvider
       if (!completionText.trim()) {
         return [];
       }
+
+      // Save for client-side prefix-matching
+      this.lastCachedPrefix = prefix;
+      this.lastCachedSuggestion = completionText;
+      this.lastCachedUri = document.uri.fsPath;
 
       // Create completion item
       const range = new vscode.Range(position, position);

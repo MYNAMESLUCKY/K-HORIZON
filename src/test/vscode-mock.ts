@@ -25,6 +25,10 @@ export class Location {
   constructor(public uri: Uri, public range: Range) {}
 }
 
+export class InlineCompletionItem {
+  constructor(public insertText: string, public range?: Range) {}
+}
+
 export enum DiagnosticSeverity {
   Error = 0,
   Warning = 1,
@@ -35,6 +39,11 @@ export enum DiagnosticSeverity {
 export enum ViewColumn {
   One = 1,
   Two = 2,
+}
+
+export enum InlineCompletionTriggerKind {
+  Invoke = 0,
+  Automatic = 1,
 }
 
 export enum SymbolKind {
@@ -130,3 +139,15 @@ export const extensions = {
 export const lm = {
   selectChatModels: async () => [],
 };
+
+export class LanguageModelChatMessage {
+  constructor(public role: number, public content: string) {}
+
+  static Assistant(content: string) {
+    return new LanguageModelChatMessage(2, content);
+  }
+
+  static User(content: string) {
+    return new LanguageModelChatMessage(1, content);
+  }
+}

@@ -57,6 +57,7 @@ export interface NpmErrorReport {
 }
 
 export type NpmErrorCategory =
+  | 'missing-dependency'
   | 'missing-script'
   | 'missing-package-json'
   | 'enoent'
@@ -156,10 +157,38 @@ function buildCuratedExcerpt(stdout: string, stderr: string, errorLines: string[
  * fix-prompt the LLM sees — it nudges the model toward known-good responses
  * (e.g. install missing deps, run with --legacy-peer-deps, chmod permissions).
  */
+function getBasePackage(pkgName: string, workspaceRoot?: string): string | null {
+  if (pkgName.startsWith('.') || pkgName.startsWith('/') || pkgName.startsWith('\\') || /^[A-Za-z]:[\\\/]/.test(pkgName)) {
+    return null; // Local file
+  }
+  
+  if (workspaceRoot) {
+    const firstPart = pkgName.split('/')[0];
+    try {
+      if (fs.existsSync(path.join(workspaceRoot, firstPart)) || fs.existsSync(path.join(workspaceRoot, 'src', firstPart))) {
+        return null;
+      }
+    } catch {
+      // Safe fallback if filesystem access fails
+    }
+  }
+
+  if (pkgName.startsWith('@')) {
+    const parts = pkgName.split('/');
+    if (parts.length >= 2) {
+      return `${parts[0]}/${parts[1]}`;
+    }
+    return pkgName;
+  }
+  const parts = pkgName.split('/');
+  return parts[0];
+}
+
 function categorize(
   npmErrorCode: string | null,
   message: string | null,
-  combinedOutput = ''
+  combinedOutput = '',
+  workspaceRoot?: string
 ): { category: NpmErrorCategory; remediation: string | null } {
   const code = (npmErrorCode || '').toUpperCase();
   const msg = (message || '').toLowerCase();
@@ -210,6 +239,22 @@ function categorize(
       remediation: 'A npm script exited with a non-zero status. Read the underlying error message above the ELIFECYCLE line for the actual root cause (compile error, missing dep, test failure, etc.) and fix that, not the script itself.',
     };
   }
+  if (/cannot find module ['"]([^'"]+)['"]|module not found: error: can't resolve ['"]([^'"]+)['"]/i.test(combinedOutput)) {
+    const match = combinedOutput.match(/cannot find module ['"]([^'"]+)['"]|module not found: error: can't resolve ['"]([^'"]+)['"]/i);
+    const pkg = match ? (match[1] || match[2]) : '';
+    
+    const basePkg = getBasePackage(pkg, workspaceRoot);
+    if (!basePkg) {
+      return {
+        category: 'compile',
+        remediation: `The local file/module "${pkg}" was not found. Please verify that the file exists and the import path is correct relative to the current file.`,
+      };
+    }
+    return {
+      category: 'missing-dependency',
+      remediation: `The package/module "${pkg}" is missing. Run "npm install ${basePkg}" to install it, or add it to package.json and run "npm install".`,
+    };
+  }
   if (/tsc|typescript|cannot find name|cannot find module|ts\(|type error/i.test(msg) || isCompile) {
     return {
       category: 'compile',
@@ -222,7 +267,8 @@ function categorize(
       remediation: 'An automated test failed (Vitest, Pytest, JUnit, Cargo test, Go test, etc.). Read the assertion failure message and expected vs actual values, locate the crash traceback, and fix the underlying code, not the test expectations (unless the test was wrong).',
     };
   }
-  if (/command not found|is not recognized as an internal or external command/i.test(msg)) {
+  if (/command not found|is not recognized as an internal or external command/i.test(msg) ||
+      /command not found|is not recognized as an internal or external command/i.test(combinedOutput)) {
     return {
       category: 'command-not-found',
       remediation: 'The executable is not on PATH. Either install it, use the npx/yarn equivalent, or run the tool through VS Code\'s integrated terminal which has the user\'s full PATH.',
@@ -339,13 +385,15 @@ export function parseCommandFailure(
     (signal !== null && signal !== undefined) ||
     npmErrorLines.length > 0;
 
-  const { category, remediation } = categorize(npmErrorCode, npmMessage, combined);
+  const { category, remediation } = categorize(npmErrorCode, npmMessage, combined, workspaceRoot);
   const curatedExcerpt = buildCuratedExcerpt(stdout || '', stderr || '', npmErrorLines);
 
   // Override category for timeout cases (signal-based termination)
   let finalCategory: NpmErrorCategory = category;
-  if (signal && /SIG(KILL|TERM|INT)/.test(signal) && !failed) {
-    // killed-but-clean exit is rare; treat as timeout
+  if (signal && /SIG(KILL|TERM|INT)/.test(signal)) {
+    // Child-process signal termination usually means our command timeout or
+    // cancellation path killed the process. Surface that explicitly instead of
+    // leaving it as an unknown failure.
     finalCategory = 'timeout';
   }
 
@@ -375,6 +423,9 @@ export function parseCommandFailure(
 export function inspectPlannedCommand(command: string, cwd: string): { ok: true } | { ok: false; reason: string } {
   const trimmed = command.trim();
   if (!trimmed) return { ok: false, reason: 'Empty command.' };
+  if (/^npm\s+(?:run|run-script)\s*$/i.test(trimmed)) {
+    return { ok: true };
+  }
 
   // Detect `npm run <script>` / `npm test` / `npm start` / `npm <lifecycle>` with no script in package.json
   const npmScriptMatch = trimmed.match(/^npm\s+(?:run(?:-script)?\s+)?([A-Za-z0-9_:.-]+)/i);

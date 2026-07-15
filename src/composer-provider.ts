@@ -187,7 +187,7 @@ export class ComposerProvider {
 
       // Gather settings and setup token budget allocator
       const settings = AIService.getSettings();
-      const tokenBudget = settings.maxContextTokens || 131000;
+      const tokenBudget = await AIService.getMaxContextTokens();
       let currentTokenCount = 0;
       let contextContent = '';
 
@@ -332,7 +332,18 @@ const a = 100;
 
 For most requests, output ONLY the file declarations and their SEARCH/REPLACE blocks.
 For new projects, you MAY add a "FINAL STEPS" section after all file blocks listing
-the npm commands the user must run to install dependencies and start the project.`;
+the npm commands the user must run to install dependencies and start the project.
+
+## CODING STANDARDS (MUST FOLLOW)
+
+Apply these consistently across all code you write or edit:
+
+- **TypeScript strict mode**: honor the project's tsconfig.json "strict" flag. Do not introduce \`any\`, \`@ts-ignore\`, or \`@ts-expect-error\` unless the existing codebase already uses them.
+- **Implicit Any**: under strict type checking, always provide explicit type annotations for function parameters and callback arguments (e.g. \`(item: ItemType, index: number) => ...\` instead of JS-style \`(item, index) => ...\`).
+- **Unused Locals & Parameters**: under strict compiler flags like "noUnusedLocals" and "noUnusedParameters", always clean up any unused variables, parameters, or imports before finalizing files. Never leave unused imports.
+- **Import & Dependency Verification**: NEVER guess or assume exports, names, or types of other modules or files in the workspace. Before writing an import statement, you MUST read the target file (using \`read_file\`) to see what it actually exports and what types it uses.
+- **Animation & Library Type-casting**: When using libraries like Framer Motion or others that expect specific tuple shapes for arrays (e.g. cubic-bezier easing arrays), always append \`as const\` or type them explicitly (e.g. \`ease: [0.6, 0.05, -0.01, 0.9] as const\` or \`ease: [0.6, 0.05, -0.01, 0.9] as [number, number, number, number]\`) to avoid compiler array type mismatches.
+- **Line Number Shifts Warning**: Line numbers in a file shift after any edits are made. If you have already edited a file in a prior turn, do NOT use line numbers from older compile/test outputs. Always re-read the file with \`read_file\` to get fresh line numbers before calling line-specific tools like \`patch_file_lines\` or \`insert_file_lines\`.`;
 
       let dynamicSystemInstruction = systemInstruction;
       const enableContinuousLearning = vscode.workspace.getConfiguration('k-horizon').get<boolean>('enableContinuousLearning', true);
@@ -391,6 +402,19 @@ the npm commands the user must run to install dependencies and start the project
         let targetFilePath = fileKey;
         if (!path.isAbsolute(targetFilePath)) {
           targetFilePath = path.join(workspaceRoot, fileKey);
+        }
+
+        const absResolved = path.resolve(targetFilePath);
+        const absRoot = path.resolve(workspaceRoot);
+        const relative = path.relative(absRoot, absResolved);
+        const isInsideWorkspace = relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+
+        if (!isInsideWorkspace) {
+          this.panel.webview.postMessage({
+            type: 'streamError',
+            error: `Refusing to edit file outside the workspace: ${fileKey}`
+          });
+          continue;
         }
 
         const relativePath = vscode.workspace.asRelativePath(vscode.Uri.file(targetFilePath));

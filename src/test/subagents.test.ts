@@ -17,4 +17,9 @@ describe('subagent tool allow-list', () => {
     expect(isToolAllowedForSubagent('backend-architect', 'ask_user')).toBe(false);
     expect(isToolAllowedForSubagent('security-reviewer', 'git_push')).toBe(false);
   });
+
+  it('allows sequentialthinking and trace_symbol_dependency tools', () => {
+    expect(isToolAllowedForSubagent('frontend-designer', 'sequentialthinking')).toBe(true);
+    expect(isToolAllowedForSubagent('frontend-designer', 'trace_symbol_dependency')).toBe(true);
+  });
 });

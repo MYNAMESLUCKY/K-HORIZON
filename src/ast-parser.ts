@@ -587,8 +587,16 @@ export class ASTParser {
     const maxFiles = 60;
     let fileCount = 0;
 
+    const visited = new Set<string>();
     const scanDir = (dir: string) => {
       if (fileCount >= maxFiles) return;
+      try {
+        const real = fs.realpathSync(dir);
+        if (visited.has(real)) return;
+        visited.add(real);
+      } catch {
+        return;
+      }
       const entries = fs.readdirSync(dir, { withFileTypes: true });
       
       entries.sort((a, b) => {

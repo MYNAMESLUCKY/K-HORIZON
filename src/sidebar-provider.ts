@@ -122,6 +122,18 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     return detectVerificationCommands(workspaceRoot);
   }
 
+  private hasEmbeddingConfiguration(config: vscode.WorkspaceConfiguration): boolean {
+    const embeddingProvider = config.get<string>('embeddingProvider', 'AICredits');
+    if (embeddingProvider === 'Ollama') {
+      return true;
+    }
+    const embeddingApiKey = config.get<string>('embeddingApiKey', '');
+    const aicreditsApiKey = config.get<string>('aicreditsApiKey', '');
+    return embeddingProvider === 'AICredits'
+      ? !!(embeddingApiKey || aicreditsApiKey)
+      : !!embeddingApiKey;
+  }
+
   // Resolve webview view, wire message handlers, and attach disposal-aware listeners
   public resolveWebviewView(
     webviewView: vscode.WebviewView,
@@ -475,7 +487,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         maxContextTokens: settings.maxContextTokens,
         hasApiKey: !!settings.apiKey || settings.provider === 'Ollama' || settings.provider === 'Copilot',
         hasSupabaseConnection: !!config.get<string>('supabaseConnectionString', ''),
-        hasEmbeddingKey: !!config.get<string>('aicreditsApiKey', ''),
+        hasEmbeddingKey: this.hasEmbeddingConfiguration(config),
         workspaceFileCount,
         diagnosticCount,
         errorCount,
@@ -565,6 +577,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       resolve(false);
     }
     this.approvalResolvers.clear();
+    if (this.toolDebugResolver) {
+      this.toolDebugResolver({ approved: false });
+      this.toolDebugResolver = undefined;
+    }
+    if (this.checklistResolver) {
+      this.checklistResolver(null);
+      this.checklistResolver = undefined;
+    }
   }
 
   /**
@@ -707,17 +727,47 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     const stepDebug = config.get<boolean>('stepDebug', false);
 
     const workspaceRoot = getWorkspaceRoot();
+    let streamStarted = false;
+    let pool: any = null;
+
+    const startStandardStream = () => {
+      if (!streamStarted) {
+        this._view?.webview.postMessage({ type: 'streamStart' });
+        this.isAgentRunning = true;
+        streamStarted = true;
+      }
+    };
+
+    const postProgress = (message: string) => {
+      startStandardStream();
+      this._view?.webview.postMessage({
+        type: 'streamToken',
+        token: `\n\n_${message}_\n`,
+      });
+    };
+
+    const getPool = async () => {
+      if (!pool) {
+        pool = await DBClient.initialize();
+      }
+      return pool;
+    };
+
+    const queryDb = async (query: string, params?: any[]) => {
+      const db = await getPool();
+      return await Promise.race([
+        db.query(query, params),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Database query timed out after 2500ms')), 2500)),
+      ]);
+    };
 
     try {
       // Build session title from the first query (limited to 30 chars)
       const sessionTitle = prompt.substring(0, 30) + (prompt.length > 30 ? '...' : '');
 
-      // Save user prompt to Supabase
-      const pool = await DBClient.initialize();
-
       // Intercept /help slash command for instant responsive help card
       if (prompt.trim() === '/help') {
-        this._view.webview.postMessage({ type: 'streamStart' });
+        startStandardStream();
         const helpContent = `### K-HORIZON AI Help & Commands
 
 Welcome to **K-HORIZON**, a powerful token-efficient agentic coding assistant!
@@ -743,12 +793,12 @@ Here are the available slash commands you can use in the chat:
         this._view.webview.postMessage({ type: 'streamEnd' });
 
         try {
-          await pool.query(
+          await queryDb(
             `INSERT INTO chat_history (role, content, timestamp, session_id, session_title)
              VALUES ($1, $2, $3, $4, $5)`,
             ['user', '/help', Date.now(), this.activeSessionId, 'Help Command']
           );
-          await pool.query(
+          await queryDb(
             `INSERT INTO chat_history (role, content, timestamp, session_id, session_title)
              VALUES ($1, $2, $3, $4, $5)`,
             ['assistant', helpContent, Date.now(), this.activeSessionId, 'Help Command']
@@ -760,6 +810,8 @@ Here are the available slash commands you can use in the chat:
         this.chatHistory.push({ role: 'assistant', content: helpContent, timestamp: Date.now() });
         return;
       }
+
+
 
       // /clear — wipe the active session's history
       if (prompt.trim() === '/clear') {
@@ -778,6 +830,7 @@ Here are the available slash commands you can use in the chat:
             type: 'streamError',
             error: `/${slashCmd} requires a code selection or active file with content.`,
           });
+          this._view.webview.postMessage({ type: 'streamEnd' });
           return;
         }
 
@@ -813,7 +866,7 @@ Here are the available slash commands you can use in the chat:
       }
 
       const settings = AIService.getSettings();
-      const tokenBudget = settings.maxContextTokens || 131000;
+      const tokenBudget = await AIService.getMaxContextTokens();
       let currentTokenCount = 0;
       let contextContent = '';
       const referencesList: { filePath: string, relativePath: string }[] = [];
@@ -852,7 +905,12 @@ Here are the available slash commands you can use in the chat:
       const selectedContextFiles = await ContextManager.resolveFileContents(realPaths);
       if (selectedContextFiles.length > 0) {
         for (const file of selectedContextFiles) {
-          addContextBlock(`### Referenced File Context: \`${file.relativePath}\``, file.content || '', file.filePath, file.relativePath);
+          const alreadySent = this.chatHistory.some(msg => 
+            msg.content && msg.content.includes(`### Referenced File Context: \`${file.relativePath}\``)
+          );
+          if (!alreadySent) {
+            addContextBlock(`### Referenced File Context: \`${file.relativePath}\``, file.content || '', file.filePath, file.relativePath);
+          }
         }
       }
 
@@ -915,7 +973,12 @@ Here are the available slash commands you can use in the chat:
       const pinnedContextFiles = await ContextManager.resolveFileContents(pinnedPaths);
       if (pinnedContextFiles.length > 0) {
         for (const file of pinnedContextFiles) {
-          addContextBlock(`### Pinned File Context: \`${file.relativePath}\``, file.content || '', file.filePath, file.relativePath);
+          const alreadySent = this.chatHistory.some(msg => 
+            msg.content && (msg.content.includes(`### Pinned File Context: \`${file.relativePath}\``) || msg.content.includes(`### Referenced File Context: \`${file.relativePath}\``))
+          );
+          if (!alreadySent) {
+            addContextBlock(`### Pinned File Context: \`${file.relativePath}\``, file.content || '', file.filePath, file.relativePath);
+          }
         }
       }
 
@@ -932,31 +995,35 @@ Here are the available slash commands you can use in the chat:
         // the rendered list at 200 files so that very large repos don't blow the
         // token budget before the active editor file gets a chance to be included.
         if (useWorkspaceContext) {
-          try {
-            const allFiles = await ContextManager.getWorkspaceFiles(200);
-            if (allFiles && allFiles.length > 0) {
-              let layoutDesc = `### Workspace Folder Layout Map (capped at 200 files):\n`;
-              allFiles.forEach(f => {
-                layoutDesc += `- ${f.relativePath}\n`;
-              });
-              layoutDesc += `\n`;
+          const alreadySentLayout = this.chatHistory.some(msg =>
+            msg.content && msg.content.includes(`### Workspace Folder Layout Map`)
+          );
+          if (!alreadySentLayout) {
+            try {
+              const allFiles = await ContextManager.getWorkspaceFiles(200);
+              if (allFiles && allFiles.length > 0) {
+                let layoutDesc = `### Workspace Folder Layout Map (capped at 200 files):\n`;
+                allFiles.forEach(f => {
+                  layoutDesc += `- ${f.relativePath}\n`;
+                });
+                layoutDesc += `\n`;
 
-              const layoutTokens = AIService.estimateTokens(layoutDesc);
-              if (currentTokenCount + layoutTokens < tokenBudget) {
-                contextContent += layoutDesc;
-                currentTokenCount += layoutTokens;
+                const layoutTokens = AIService.estimateTokens(layoutDesc);
+                if (currentTokenCount + layoutTokens < tokenBudget) {
+                  contextContent += layoutDesc;
+                  currentTokenCount += layoutTokens;
+                }
               }
+            } catch (wsErr: any) {
+              console.error('Failed to query default workspace layout map:', wsErr);
             }
-          } catch (wsErr: any) {
-            console.error('Failed to query default workspace layout map:', wsErr);
           }
         }
 
-        // Semantic Vector RAG Search using pgvector if checked (only if aicreditsApiKey is set)
+        // Semantic Vector RAG Search using pgvector/local fallback if configured.
         if (useWorkspaceContext) {
           const config = vscode.workspace.getConfiguration('k-horizon');
-          const apiKey = config.get<string>('aicreditsApiKey', '');
-          if (apiKey) {
+          if (this.hasEmbeddingConfiguration(config)) {
             const statusMessage = vscode.window.setStatusBarMessage('$(sync~spin) K-Horizon: Searching vector index...', 10000);
             try {
               const ragResult = await RAGService.retrieveContext(prompt, 5);
@@ -985,12 +1052,16 @@ Here are the available slash commands you can use in the chat:
         if (activeContext) {
           let activeEditorDesc = `### Active Editor Context:\n`;
           activeEditorDesc += `- Active File: \`${activeContext.relativePath}\`\n`;
-          activeEditorDesc += `- Line Range: lines ${activeContext.startLine} to ${activeContext.endLine}\n`;
+          activeEditorDesc += `- Cursor Position: line ${activeContext.cursorLine}, column ${activeContext.cursorColumn}\n`;
+          activeEditorDesc += `- Selection Line Range: lines ${activeContext.startLine} to ${activeContext.endLine}\n`;
           if (activeContext.selectionText) {
             activeEditorDesc += `- Highlighted Selection Code:\n\`\`\`\n${activeContext.selectionText}\n\`\`\`\n`;
           }
           if (activeContext.surroundingContext) {
             activeEditorDesc += `- Surrounding Context Code:\n\`\`\`\n${activeContext.surroundingContext}\n\`\`\`\n`;
+          }
+          if (activeContext.viewportContext) {
+            activeEditorDesc += `- Visible Viewport Code (On Screen):\n\`\`\`\n${activeContext.viewportContext}\n\`\`\`\n`;
           }
 
           // Live Editor Diagnostics for active file
@@ -1016,8 +1087,7 @@ Here are the available slash commands you can use in the chat:
         }
 
         // 2. Inject recently opened file list (temporal context). Cap to 3 most
-        // recent files so they don't crowd out the active editor file. Previously
-        // the full history was appended with no cap.
+        // recent files so they don't crowd out the active editor file.
         if (this.activeFileHistory.length > 0) {
           const recentFiles = this.activeFileHistory.slice(-3);
           let temporalDesc = `### Recently Opened/Focused Files (most recent 3):\n`;
@@ -1033,26 +1103,26 @@ Here are the available slash commands you can use in the chat:
           }
         }
 
-        // 3. Skip the second workspace file layout injection. Previously the same
-        // 1000-file list was rendered twice (once unconditionally above and once
-        // here when `useWorkspaceContext` was checked). The single opt-in injection
-        // above is sufficient.
+        // 3. Skip the second workspace file layout injection.
 
         // 4. Inject Active Editor File Content if not already explicitly referenced or pinned (summarized if large)
         if (activeContext && !referencedPaths.includes(activeContext.filePath) && !pinnedPaths.includes(activeContext.filePath)) {
-          try {
-            const resolved = await ContextManager.resolveFileContents([activeContext.filePath]);
-            if (resolved.length > 0) {
-              addContextBlock(`### Current Editor Active File Content: \`${activeContext.relativePath}\``, resolved[0].content || '', activeContext.filePath, activeContext.relativePath);
+          const alreadySentActive = this.chatHistory.some(msg =>
+            msg.content && msg.content.includes(`### Current Editor Active File Content: \`${activeContext.relativePath}\``)
+          );
+          if (!alreadySentActive) {
+            try {
+              const resolved = await ContextManager.resolveFileContents([activeContext.filePath]);
+              if (resolved.length > 0) {
+                addContextBlock(`### Current Editor Active File Content: \`${activeContext.relativePath}\``, resolved[0].content || '', activeContext.filePath, activeContext.relativePath);
+              }
+            } catch (activeErr) {
+              console.error("Failed to read active editor full file text:", activeErr);
             }
-          } catch (activeErr) {
-            console.error("Failed to read active editor full file text:", activeErr);
           }
         }
 
-        // 5. Inject other open editor tabs context (limited to at most 2 tabs,
-// excluding build assets). Previously capped at 5 which consumed ~10k tokens
-// before the user's actual file got a chance to be included.
+        // 5. Inject other open editor tabs context (limited to at most 2 tabs, excluding build assets)
         try {
           const openDocs = vscode.workspace.textDocuments.filter(doc => doc.uri.scheme === 'file');
           const docsToProcess = openDocs
@@ -1079,7 +1149,12 @@ Here are the available slash commands you can use in the chat:
           if (docPaths.length > 0) {
             const resolvedDocs = await ContextManager.resolveFileContents(docPaths);
             for (const file of resolvedDocs) {
-              addContextBlock(`### Open Editor Tab Content: \`${file.relativePath}\``, file.content || '');
+              const alreadySentOpen = this.chatHistory.some(msg =>
+                msg.content && msg.content.includes(`### Open Editor Tab Content: \`${file.relativePath}\``)
+              );
+              if (!alreadySentOpen) {
+                addContextBlock(`### Open Editor Tab Content: \`${file.relativePath}\``, file.content || '');
+              }
             }
           }
         } catch (docsErr) {
@@ -1116,22 +1191,19 @@ Focus heavily on architecture and readability:
       } else if (role === 'planner') {
         rolePrompt = `You are K-HORIZON AI acting as an Agentic Software Architect and Planner.
 Your execution flow for any non-trivial task MUST follow these phases:
-1. **Plan Phase**: Create an implementation plan file inside the \`.k-horizon\` directory named \`.k-horizon/implementation_plan.md\` describing the changes, files to touch, and verification steps. Use the \`write_file\` tool.
-2. **Task Phase**: Create a task list file inside the \`.k-horizon\` directory named \`.k-horizon/task.md\` listing the TODO items. Use the \`write_file\` tool.
-3. **Execute Phase**: Step through the tasks. For each task:
-   - Perform the code change using \`write_file\`, \`edit_file\`, etc.
-   - Update the task list file to check off completed items (\`[x]\`).
+1. **Plan & Task Phase (AUTOMATED)**: An implementation plan (\`.k-horizon/implementation_plan.md\`) and a task list (\`.k-horizon/task.md\`) have already been created automatically for you in the workspace. Do NOT call \`write_file\` to recreate or rewrite them.
+2. **Execute Phase**: Proceed directly to this phase. Step through the tasks in the task list:
+   - Perform the code changes using \`write_file\`, \`edit_file\`, etc.
+   - Update the task list file (\`.k-horizon/task.md\`) to check off completed items (\`[x]\`).
    - Run compilation or verification if appropriate.
-4. **Walkthrough Phase**: Create a walkthrough file inside the \`.k-horizon\` directory named \`.k-horizon/walkthrough.md\` summarizing what was done and tested. Use the \`write_file\` tool.`;
+3. **Walkthrough Phase**: Create a walkthrough file inside the \`.k-horizon\` directory named \`.k-horizon/walkthrough.md\` summarizing what was done and tested. Use the \`write_file\` tool.`;
       } else {
         rolePrompt = `You are K-HORIZON AI acting as a Principal Developer.
 Focus on writing clean, efficient, production-ready code blocks directly with minimal conversational filler.
 For any non-trivial or multi-file task, you MUST follow these phases:
-1. **Understand Phase**: Analyze the user prompt, verify the workspace files and structure.
-2. **Plan Phase**: Create an implementation plan inside the \`.k-horizon\` directory named \`.k-horizon/implementation_plan.md\` outlining the proposed changes, files to be created/modified, and verification strategy. Use the \`write_file\` tool.
-3. **Task Phase**: Create a task list file inside the \`.k-horizon\` directory named \`.k-horizon/task.md\` to keep track of progress. Use the \`write_file\` tool.
-4. **Execute Phase**: Implement the plan, checking off completed tasks in \`.k-horizon/task.md\` as you go.
-5. **Walkthrough Phase**: Conclude by writing a walkthrough file inside the \`.k-horizon\` directory named \`.k-horizon/walkthrough.md\` summarizing the changes made, tests run, and validation results.`;
+1. **Plan & Task Phase (AUTOMATED)**: An implementation plan (\`.k-horizon/implementation_plan.md\`) and a task list (\`.k-horizon/task.md\`) have already been created automatically for you in the workspace. Do NOT call \`write_file\` to recreate or rewrite them.
+2. **Execute Phase**: Proceed directly to this phase. Implement the plan, checking off completed tasks in \`.k-horizon/task.md\` as you go.
+3. **Walkthrough Phase**: Conclude by writing a walkthrough file inside the \`.k-horizon\` directory named \`.k-horizon/walkthrough.md\` summarizing the changes made, tests run, and validation results.`;
       }
 
       const now = new Date();
@@ -1143,6 +1215,11 @@ For any non-trivial or multi-file task, you MUST follow these phases:
 Apply these consistently across all code you write or edit:
 
 - **TypeScript strict mode**: honor the project's tsconfig.json "strict" flag. Do not introduce \`any\`, \`@ts-ignore\`, or \`@ts-expect-error\` unless the existing codebase already uses them.
+- **Implicit Any**: under strict type checking, always provide explicit type annotations for function parameters and callback arguments (e.g. \`(item: ItemType, index: number) => ...\` instead of JS-style \`(item, index) => ...\`).
+- **Unused Locals & Parameters**: under strict compiler flags like "noUnusedLocals" and "noUnusedParameters", always clean up any unused variables, parameters, or imports before finalizing files. Never leave unused imports.
+- **Import & Dependency Verification**: NEVER guess or assume exports, names, or types of other modules or files in the workspace. Before writing an import statement, you MUST read the target file (using \`read_file\`) to see what it actually exports and what types it uses.
+- **Animation & Library Type-casting**: When using libraries like Framer Motion or others that expect specific tuple shapes for arrays (e.g. cubic-bezier easing arrays), always append \`as const\` or type them explicitly (e.g. \`ease: [0.6, 0.05, -0.01, 0.9] as const\` or \`ease: [0.6, 0.05, -0.01, 0.9] as [number, number, number, number]\`) to avoid compiler array type mismatches.
+- **Line Number Shifts Warning**: Line numbers in a file shift after any edits are made. If you have already edited a file in a prior turn, do NOT use line numbers from older compile/test outputs. Always re-read the file with \`read_file\` to get fresh line numbers before calling line-specific tools like \`patch_file_lines\` or \`insert_file_lines\`.
 - **Naming**: \`PascalCase\` for types/classes, \`camelCase\` for variables/functions, \`UPPER_SNAKE_CASE\` for module-level constants, kebab-case for file names unless the project convention differs.
 - **Imports**: ES module syntax (\`import\`/\`export\`). Order: 1) node builtins, 2) third-party packages, 3) workspace imports (blank line between groups). No default exports for shared utilities.
 - **Async**: always \`await\` or explicitly return the Promise; never fire-and-forget without \`.catch\`.
@@ -1166,7 +1243,7 @@ Rules:
 4. When writing code snippets that are NOT meant to be written to files, specify the language in the markdown block (e.g. \`\`\`typescript).
 5. Do NOT compromise on code quality or completeness to save tokens. Never use placeholders or comments like '// rest of code remains the same' to truncate code blocks. Always provide complete, working implementations in all code blocks and file edits.
 6. Self-heal on transient failures (up to 3 retries per compile/test phase). After hitting the budget, summarize the blocker to the user instead of burning more turns. Analyze failure output, identify the corrected parameters or files, and output new tool calls to rectify the error. Never silently give up, but do recognize when manual user input is needed.
-7. For any non-trivial or multi-file task, you MUST first understand the prompt, create \`.k-horizon/implementation_plan.md\`, track your progress with a \`.k-horizon/task.md\` list, and conclude by creating \`.k-horizon/walkthrough.md\` summarizing your work and verification results.
+7. For any non-trivial or multi-file task, an implementation plan (\`.k-horizon/implementation_plan.md\`) and task list (\`.k-horizon/task.md\`) have already been automatically created for you. Do NOT call \`write_file\` to recreate or rewrite them. Proceed directly to executing the tasks, updating \`.k-horizon/task.md\` as you make progress, and finally conclude by creating \`.k-horizon/walkthrough.md\` summarizing your work and verification results.
 8. Keep looping in your autonomous execution loop. Do NOT stop or ask the user to run commands for you. You have full terminal and file execution capabilities. Sequentially execute all necessary tool calls (finding, creating, editing files, compilation checks, test runs) until the task is completely finished. Only output a final text summary without tool calls when everything is fully verified and complete.
 9. Efficiency & Batching: To minimize response latency and reduce the time spent between commands, you are highly encouraged to output MULTIPLE tool calls within a single response turn whenever possible (e.g. writing/editing files and running compile in one go), rather than performing them one-by-one.
 10. Tool Calls vs Conversational Responses: You MUST NOT output conversational text-only responses explaining what you plan to do, listing steps in markdown, or describing code changes. You MUST output the actual JSON tool call (see JSON contract below) to execute the actions immediately in the same turn. Never output a text-only explanation without tool calls unless the entire user task is 100% completed, fully verified, and you are summarizing the completed work. The legacy XML \`tool_call\` form is still parsed for backwards compatibility, but JSON is preferred.
@@ -1186,6 +1263,8 @@ JSON tool-call contract (always emit JSON, single call or array):
 11. **Verify Before Claiming Done**: After every \`write_file\` or \`edit_file\` call, follow up with \`verify_edit\` to read the file back from disk and check for new diagnostics. After any multi-file change, run the build/tests. Only claim a task is complete when those verifications actually pass — the run output must show success, not absence of errors.
 12. **Edit Hygiene**: When \`edit_file\` returns "target not found", DO NOT guess a different target. Read the file first with \`read_file\`, then copy the EXACT bytes you want to replace into your next \`target_content\` argument.
 13. **Visible Reasoning Summary**: Do not reveal private chain-of-thought. When useful, provide a short visible summary of your approach and verification status in normal assistant text after the work is complete.
+14. **No Local Package Installs & Rollbacks**: NEVER run package installation commands (like \`npm install\`, \`yarn add\`, \`pip install\`) for relative file imports, local sub-folders, or module paths (e.g. those starting with \`.\`, \`/\`, \`..\`, or matching workspace directories). If a local module is missing, create the file or correct the import path. If a compilation error is due to a local component or file that you plan to create in subsequent steps, do NOT rollback or undo your edits; simply proceed to create the missing file in the next step.
+15. **Prioritize MCP Tools**: You MUST prioritize using external MCP tools (like \`mcp__Filesystem__read_file\`, \`mcp__Filesystem__write_file\`, \`mcp__Filesystem__list_directory\`, \`mcp__Filesystem__search_grep\`, and \`mcp__Git__*\` tools) over their built-in equivalents (\`read_file\`, \`write_file\`, \`list_dir\`, \`grep_search\`, \`git_status\`, \`git_diff\`).
 
 You have access to the following tools to interact with the filesystem, run commands, and search the web:
 
@@ -1360,6 +1439,28 @@ When the user asks you to build a website, app, API, or any new project AND ther
 
 **IMPORTANT:** When scaffolding a new project, NEVER try to install dependencies BEFORE creating \`package.json\`. Always run \`npm init -y\` first. The \`run_command\` tool supports \`npm init\`, \`npm create\`, and \`npx create-*\` commands even when no \`package.json\` exists yet.
 
+### Tool Selection Guidelines & Hierarchy:
+You have multiple tools to query the codebase and make edits. Follow this hierarchy to choose the most efficient tool:
+1. **Precise File Editing (High Preference):**
+   - For targeted bug fixes, linter/compiler repairs, or modifying short sections where you know the line numbers: ALWAYS use \`patch_file_lines\` or \`insert_file_lines\`. It is much faster and safer than rewriting full files.
+   - For global refactoring, renaming variables/imports, or search-and-replace across multiple files: Use \`replace_in_files\`.
+   - For block modifications where lines are not known, or creating new files: Use \`edit_file\` or \`write_file\`.
+   - For scaffolding/creating new directories before creating files: Use \`create_directory\`.
+2. **Codebase Symbol & Reference Analysis (LSP Preference):**
+   - To find definitions, callers, or trace where things are used: ALWAYS use \`find_definitions\`, \`find_references\`, or \`trace_symbol_dependency\` (uses VS Code's high-fidelity LSP language servers). Avoid reading random files or raw grep searching if you can trace symbols directly.
+   - To check file metadata (size, lines, modified time) quickly without loading contents: Use \`get_file_metadata\` (highly token-efficient!).
+   - To query functions, classes, or types workspace-wide: Use \`search_workspace_symbols\`.
+   - To check file-wide outlines: Use \`get_file_outline\`.
+3. **Keyword & Directory Search:**
+   - To find files matching a name pattern: Use \`find_files\`.
+   - To search for text snippets or matches globally: Use \`grep_search\`.
+   - To list directory contents: Use \`list_dir\`.
+4. **Shell & Verification Commands:**
+   - To run tests, compile builds, or execute shell checks: Use \`run_command\`. Pass the \`directory\` parameter if running in a subdirectory; NEVER use \`cd\` inside the command.
+   - To view current git status or git diff: Use \`git_status\` or \`git_diff\`.
+   - To inspect git changes for a single file: Use \`git_diff_file\`.
+   - To verify that your edits succeeded and compile cleanly: Use \`verify_edit\`.
+
 Instructions for Tool Calls:
 - To call a tool, you MUST output the actual JSON tool call (see JSON contract in rule 10). Emitting JSON is required. The legacy XML format is only supported for compatibility.
 - Self-Healing & Error Recovery: If a compilation command, test runner, or file edit tool execution fails, review the error log, use get_library_docs to double check templates/APIs, correct your parameters, and retry. Do not give up immediately.
@@ -1369,15 +1470,26 @@ Instructions for Tool Calls:
       let mcpToolsPrompt = '';
       const mcpTools = MCPManager.getAllTools();
       if (mcpTools.length > 0) {
-        mcpToolsPrompt = `\n\nYou also have access to the following external MCP (Model Context Protocol) tools from connected servers:\n`;
+        mcpToolsPrompt = `\n\n## External MCP (Model Context Protocol) Tools (HIGHEST PRIORITY)
+You MUST prioritize using these external MCP tools (especially Filesystem and Git tools) over any built-in equivalents. Below is the list of available MCP tools:\n`;
         mcpTools.forEach((tool, index) => {
           mcpToolsPrompt += `\n${index + 27}. Call tool "${tool.name}" on server "${tool.serverName}" (${tool.description || 'no description'}):\n`;
-          mcpToolsPrompt += `{"name":"mcp__${tool.serverName}__${tool.name}","arguments":{}}\n`;
+          const propList: string[] = [];
+          const argsTemplate: Record<string, string> = {};
           if (tool.inputSchema && tool.inputSchema.properties) {
             Object.keys(tool.inputSchema.properties).forEach(propName => {
               const prop = tool.inputSchema.properties[propName];
-              mcpToolsPrompt += `  - ${propName}: [${prop.type}${prop.description ? ': ' + prop.description : ''}]\n`;
+              const desc = prop.description ? `: ${prop.description}` : '';
+              propList.push(`  - ${propName}: [${prop.type}${desc}]`);
+              argsTemplate[propName] = `<${prop.type}${desc}>`;
             });
+          }
+          const argsStr = Object.keys(argsTemplate).length > 0 
+            ? JSON.stringify(argsTemplate) 
+            : '{}';
+          mcpToolsPrompt += `{"name":"mcp__${tool.serverName}__${tool.name}","arguments":${argsStr}}\n`;
+          if (propList.length > 0) {
+            mcpToolsPrompt += propList.join('\n') + '\n';
           }
           mcpToolsPrompt += `\n`;
         });
@@ -1465,11 +1577,31 @@ Any other format is invalid and cannot be parsed.`;
         this._view.webview.postMessage({ type: 'streamStart', column: 'right' });
         this.isAgentRunning = true;
         
+        const userMessageContent = `${contextContent}User Request:\n${prompt}`;
+        const userTimestamp = Date.now();
+
         conversationMessages.push({
           role: 'user',
-          content: `${contextContent}User Request:\n${prompt}`,
-          timestamp: Date.now()
+          content: userMessageContent,
+          timestamp: userTimestamp
         });
+
+        this.chatHistory.push({
+          role: 'user',
+          content: userMessageContent,
+          timestamp: userTimestamp
+        });
+
+        // Persist user message to DB immediately so history survives reloads
+        try {
+          await queryDb(
+            `INSERT INTO chat_history (role, content, timestamp, session_id, session_title) 
+             VALUES ($1, $2, $3, $4, $5)`,
+            ['user', userMessageContent, userTimestamp, this.activeSessionId, sessionTitle]
+          );
+        } catch (dbErr) {
+          console.error('Failed to save split-screen user message to DB:', dbErr);
+        }
         
         const leftStream = AIService.streamResponse(
           conversationMessages,
@@ -1495,12 +1627,14 @@ Any other format is invalid and cannot be parsed.`;
           customProfile?.temperature
         );
         
+        let assistantCompleted = false;
+
         try {
           const [resLeft, resRight] = await Promise.all([leftStream, rightStream]);
           const combinedAssResult = `**Model 1 Output:**\n${resLeft}\n\n**Model 2 Output:**\n${resRight}`;
           
           try {
-            await pool.query(
+            await queryDb(
               `INSERT INTO chat_history (role, content, timestamp, session_id, session_title) 
                VALUES ($1, $2, $3, $4, $5)`,
               ['assistant', combinedAssResult, Date.now(), this.activeSessionId, sessionTitle]
@@ -1509,15 +1643,29 @@ Any other format is invalid and cannot be parsed.`;
             console.error('Failed to save split-screen assistant response to DB:', dbErr);
           }
           
-          this.chatHistory.push({ role: 'user', content: `${contextContent}User Request:\n${prompt}`, timestamp: Date.now() });
           this.chatHistory.push({ role: 'assistant', content: combinedAssResult, timestamp: Date.now() });
-          
+          assistantCompleted = true;
         } catch (streamErr: any) {
           this._view?.webview.postMessage({ type: 'streamError', error: streamErr.message || 'Stream failed' });
         } finally {
           this._view?.webview.postMessage({ type: 'streamEnd', column: 'left' });
           this._view?.webview.postMessage({ type: 'streamEnd', column: 'right' });
           this.isAgentRunning = false;
+
+          if (!assistantCompleted) {
+            // Rollback the unanswered user message
+            if (this.chatHistory.length > 0 && this.chatHistory[this.chatHistory.length - 1].timestamp === userTimestamp) {
+              this.chatHistory.pop();
+            }
+            try {
+              await queryDb(
+                `DELETE FROM chat_history WHERE session_id = $1 AND timestamp = $2 AND role = 'user'`,
+                [this.activeSessionId, userTimestamp]
+              );
+            } catch (dbErr) {
+              console.error('Failed to rollback split-screen user message from DB:', dbErr);
+            }
+          }
         }
         return;
       }
@@ -1525,10 +1673,6 @@ Any other format is invalid and cannot be parsed.`;
       // ----------------------------------------------------
       // STANDARD AGENT LOOP (LANGGRAPH)
       // ----------------------------------------------------
-      this._view.webview.postMessage({ type: 'streamStart' });
-      this.isAgentRunning = true;
-
-      // Add user input with full resolved context to history
       const userMessageContent = `${contextContent}User Request:\n${prompt}`;
       const userTimestamp = Date.now();
       conversationMessages.push({
@@ -1536,7 +1680,7 @@ Any other format is invalid and cannot be parsed.`;
         content: userMessageContent,
         timestamp: userTimestamp
       });
-      
+
       this.chatHistory.push({
         role: 'user',
         content: userMessageContent,
@@ -1545,7 +1689,7 @@ Any other format is invalid and cannot be parsed.`;
 
       // Persist user message to DB immediately so history survives reloads
       try {
-        await pool.query(
+        await queryDb(
           `INSERT INTO chat_history (role, content, timestamp, session_id, session_title) 
            VALUES ($1, $2, $3, $4, $5)`,
           ['user', userMessageContent, userTimestamp, this.activeSessionId, sessionTitle]
@@ -1595,6 +1739,7 @@ Any other format is invalid and cannot be parsed.`;
           });
 
           ToolManager.resetWebSearchCount();
+          startStandardStream();
           const graph = createAgentGraph();
           const graphResult = await graph.invoke({
             chatHistory: conversationMessages,
@@ -1651,7 +1796,7 @@ Any other format is invalid and cannot be parsed.`;
           // Save assistant response to DB
           if (finalResponse) {
             try {
-              await pool.query(
+              await queryDb(
                 `INSERT INTO chat_history (role, content, timestamp, session_id, session_title) 
                  VALUES ($1, $2, $3, $4, $5)`,
                 ['assistant', finalResponse, Date.now(), this.activeSessionId, sessionTitle]
@@ -1686,7 +1831,7 @@ Any other format is invalid and cannot be parsed.`;
             this.chatHistory.pop();
           }
           try {
-            await pool.query(
+            await queryDb(
               `DELETE FROM chat_history WHERE session_id = $1 AND timestamp = $2 AND role = 'user'`,
               [this.activeSessionId, userTimestamp]
             );

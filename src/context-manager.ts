@@ -255,9 +255,12 @@ export class ContextManager {
     relativePath: string;
     selectionText: string;
     surroundingContext: string;
+    viewportContext: string;
     languageId: string;
     startLine: number;
     endLine: number;
+    cursorLine: number;
+    cursorColumn: number;
   } | null {
     const editor = vscode.window.activeTextEditor;
     if (!editor) return null;
@@ -284,6 +287,25 @@ export class ContextManager {
       endLine = currentLine + 1;
     }
 
+    const cursorLine = selection.active.line + 1;
+    const cursorColumn = selection.active.character + 1;
+
+    // Viewport text lines currently on screen
+    const visibleRanges = editor.visibleRanges;
+    let viewportContext = '';
+    if (visibleRanges && visibleRanges.length > 0) {
+      for (const range of visibleRanges) {
+        const start = range.start.line;
+        const end = range.end.line;
+        viewportContext += `--- Lines ${start + 1} to ${end + 1} visible ---\n`;
+        for (let i = start; i <= end; i++) {
+          if (i < document.lineCount) {
+            viewportContext += `${document.lineAt(i).text}\n`;
+          }
+        }
+      }
+    }
+
     // Get surrounding lines for context
     const contextRangeLines = 8;
     const docLines = document.lineCount;
@@ -308,9 +330,12 @@ export class ContextManager {
       relativePath,
       selectionText,
       surroundingContext,
+      viewportContext,
       languageId,
       startLine,
-      endLine
+      endLine,
+      cursorLine,
+      cursorColumn
     };
   }
 }

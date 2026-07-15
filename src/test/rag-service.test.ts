@@ -2,6 +2,10 @@ import { describe, expect, it, vi, beforeEach, afterEach } from 'vitest';
 import { RAGService } from '../rag-service';
 import { DBClient } from '../db-client';
 import { workspace } from 'vscode';
+import * as fs from 'fs';
+import * as path from 'path';
+import * as os from 'os';
+import * as workspaceUtils from '../workspace-utils';
 
 describe('RAGService', () => {
   let mockPool: any;
@@ -22,6 +26,7 @@ describe('RAGService', () => {
     };
 
     vi.spyOn(DBClient, 'initialize').mockResolvedValue(mockPool);
+    vi.spyOn(DBClient, 'hasConnectionString').mockResolvedValue(true);
   });
 
   afterEach(() => {
@@ -103,6 +108,50 @@ describe('RAGService', () => {
         workspace.getConfiguration = origGetConfig;
       }
     });
+
+    it('uses Gemini OpenAI-compatible embeddings endpoint without key query params', async () => {
+      const origGetConfig = workspace.getConfiguration;
+      workspace.getConfiguration = () => ({
+        get: (key: string, defaultValue?: any) => {
+          const values: Record<string, any> = {
+            embeddingProvider: 'Gemini',
+            embeddingModel: 'text-embedding-004',
+            embeddingApiKey: 'fake-gemini-key',
+            embeddingBaseURL: '',
+          };
+          return values[key] ?? defaultValue;
+        },
+      } as any);
+
+      mockPool.query.mockResolvedValueOnce({ rows: [] }); // Cache miss
+
+      const mockResponse = {
+        ok: true,
+        json: async () => ({
+          data: [
+            { index: 0, embedding: new Array(1024).fill(0.6) }
+          ]
+        })
+      };
+      const origFetch = global.fetch;
+      const fetchSpy = vi.fn().mockResolvedValue(mockResponse as any);
+      global.fetch = fetchSpy;
+
+      try {
+        const results = await RAGService.getEmbeddings(['gemini input']);
+
+        const [urlArg, initArg] = fetchSpy.mock.calls[0];
+        const parsedBody = JSON.parse(initArg.body);
+        expect(results[0]).toEqual(new Array(1024).fill(0.6));
+        expect(urlArg).toBe('https://generativelanguage.googleapis.com/v1beta/openai/embeddings');
+        expect(urlArg).not.toContain('?key=');
+        expect(initArg.headers.Authorization).toBe('Bearer fake-gemini-key');
+        expect(parsedBody.model).toBe('text-embedding-004');
+      } finally {
+        global.fetch = origFetch;
+        workspace.getConfiguration = origGetConfig;
+      }
+    });
   });
 
   describe('retrieveContext', () => {
@@ -165,6 +214,44 @@ describe('RAGService', () => {
       expect(result.context).toContain('MyClass');
       expect(result.context).toContain('helperFunc');
       expect(result.files).toHaveLength(2); // Local file (a.ts) + external related file (b.ts)
+    });
+  });
+
+  describe('local fallback (no connection string)', () => {
+    beforeEach(() => {
+      vi.spyOn(DBClient, 'hasConnectionString').mockResolvedValue(false);
+      // Mock getWorkspaceRoot to return a temp directory
+      const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'k-horizon-rag-local-'));
+      vi.spyOn(workspaceUtils, 'getWorkspaceRoot').mockReturnValue(tempDir);
+    });
+
+    afterEach(() => {
+      const root = workspaceUtils.getWorkspaceRoot();
+      if (root && root.includes('k-horizon-rag-local-')) {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+
+    it('indexes files locally and retrieves context without database', async () => {
+      vi.spyOn(RAGService, 'getEmbeddings').mockResolvedValue([new Array(1024).fill(0.1)]);
+
+      await RAGService.indexFile('/src/a.ts', 'src/a.ts', 'export function foo() {}');
+
+      const result = await RAGService.retrieveContext('foo', 1);
+      expect(result.context).toContain('foo');
+      expect(result.files).toHaveLength(1);
+      expect(result.files[0].relativePath).toBe('src/a.ts');
+    });
+
+    it('deletes files from local index', async () => {
+      vi.spyOn(RAGService, 'getEmbeddings').mockResolvedValue([new Array(1024).fill(0.1)]);
+
+      await RAGService.indexFile('/src/a.ts', 'src/a.ts', 'export function foo() {}');
+      await RAGService.deleteFileFromIndex('/src/a.ts');
+
+      const result = await RAGService.retrieveContext('foo', 1);
+      expect(result.context).toBe('');
+      expect(result.files).toHaveLength(0);
     });
   });
 });

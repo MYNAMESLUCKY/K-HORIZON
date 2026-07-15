@@ -56,10 +56,11 @@ export class MCPManager {
   private static getStoredConfigs(): McpServerConfig[] {
     let configs = this.context.globalState.get<McpServerConfig[]>('k-horizon-mcp-servers', []) || [];
 
-    // Check if we need to migrate/update the defaults (i.e. if they contain the old non-existent 'Git' default server or have fewer than expected servers)
-    const hasOldDefaults = configs.some(c => c.name === 'Git');
+    // Check if we need to migrate/update the defaults (i.e. if they contain the old non-existent 'GroundedDocs' or 'ProContext' default servers, have fewer than expected servers, or lack the Git server)
+    const hasOldDefaults = configs.some(c => c.name === 'GroundedDocs' || c.name === 'ProContext');
+    const hasGit = configs.some(c => c.name === 'Git');
 
-    if (!configs || configs.length < 7 || hasOldDefaults) {
+    if (!configs || configs.length < 6 || hasOldDefaults || !hasGit) {
       configs = [
         {
           name: 'Memory',
@@ -82,9 +83,9 @@ export class MCPManager {
           args: ['-y', '@modelcontextprotocol/server-sequential-thinking']
         },
         {
-          name: 'GroundedDocs',
+          name: 'Git',
           command: 'npx',
-          args: ['-y', '@arabold/docs-mcp-server']
+          args: ['-y', '@modelcontextprotocol/server-git']
         },
         {
           // Context7: free, public, no-auth remote HTTP MCP for up-to-date library docs
@@ -92,13 +93,6 @@ export class MCPManager {
           url: 'https://mcp.context7.com/mcp',
           command: '',
           args: []
-        },
-        {
-          // ProContext: open-source documentation layer for AI coding agents (2000+ libraries)
-          // 4 MCP tools: resolve, search, read, outline — MIT licensed, stdio transport via uvx
-          name: 'ProContext',
-          command: 'uvx',
-          args: ['procontext']
         }
       ];
       this.context.globalState.update('k-horizon-mcp-servers', configs);
@@ -108,6 +102,20 @@ export class MCPManager {
 
   private static setStoredConfigs(configs: McpServerConfig[]) {
     this.context.globalState.update('k-horizon-mcp-servers', configs);
+  }
+
+  public static getCanonicalServerName(name: string): string {
+    if (!this.context) {
+      for (const key of this.serverTools.keys()) {
+        if (key.toLowerCase() === name.toLowerCase()) {
+          return key;
+        }
+      }
+      return name;
+    }
+    const configs = this.getStoredConfigs();
+    const found = configs.find(c => c.name.toLowerCase() === name.toLowerCase());
+    return found ? found.name : name;
   }
 
   public static async startAllServers() {
@@ -140,25 +148,27 @@ export class MCPManager {
   }
 
   public static async deleteServer(name: string): Promise<void> {
-    this.stopServer(name);
-    this.serverTools.delete(name);
+    const canonicalName = this.getCanonicalServerName(name);
+    this.stopServer(canonicalName);
+    this.serverTools.delete(canonicalName);
     const cached = this.getCachedTools();
-    delete cached[name];
+    delete cached[canonicalName];
     this.setCachedTools(cached);
 
     const configs = this.getStoredConfigs();
-    const filtered = configs.filter(c => c.name !== name);
+    const filtered = configs.filter(c => c.name !== canonicalName);
     this.setStoredConfigs(filtered);
   }
 
   public static async restartServer(name: string): Promise<void> {
+    const canonicalName = this.getCanonicalServerName(name);
     const configs = this.getStoredConfigs();
-    const config = configs.find(c => c.name === name);
+    const config = configs.find(c => c.name === canonicalName);
     if (!config) {
       throw new Error(`MCP Server with name "${name}" is not configured.`);
     }
-    this.lastConnectTime.delete(name);
-    this.stopServer(name);
+    this.lastConnectTime.delete(canonicalName);
+    this.stopServer(canonicalName);
     await this.startServer(config);
   }
 
@@ -224,6 +234,13 @@ export class MCPManager {
       const workspaceRoot = getWorkspaceRoot();
       let command = config.command;
       let args = [...config.args];
+
+      if (!this.commandExists(command)) {
+        const errorMsg = `Command "${command}" was not found on your system PATH. Please ensure the required runtime (e.g. Node.js for npx, or uv for uvx) is installed.`;
+        this.serverStatus.set(config.name, 'Error');
+        this.errorMessages.set(config.name, errorMsg);
+        throw new Error(errorMsg);
+      }
 
       if (workspaceRoot) {
         args = args.map(arg => {
@@ -471,8 +488,8 @@ export class MCPManager {
 
       const timeout = setTimeout(() => {
         this.responseResolvers.delete(resolverKey);
-        reject(new Error(`Request "${method}" to server "${serverName}" timed out after 15 seconds.`));
-      }, 15000);
+        reject(new Error(`Request "${method}" to server "${serverName}" timed out after 60 seconds.`));
+      }, 60000);
 
       this.responseResolvers.set(resolverKey, (response: any) => {
         clearTimeout(timeout);
@@ -519,13 +536,14 @@ export class MCPManager {
   }
 
   public static async fetchServerTools(serverName: string): Promise<void> {
+    const canonicalName = this.getCanonicalServerName(serverName);
     try {
-      const toolsResult = await this.sendRequest(serverName, 'tools/list', {});
+      const toolsResult = await this.sendRequest(canonicalName, 'tools/list', {});
       const tools = (toolsResult.tools || []) as McpTool[];
-      this.serverTools.set(serverName, tools);
+      this.serverTools.set(canonicalName, tools);
 
       const cached = this.getCachedTools();
-      cached[serverName] = tools;
+      cached[canonicalName] = tools;
       this.setCachedTools(cached);
     } catch (err: any) {
       console.error(`Failed to list tools for MCP server ${serverName}:`, err);
@@ -534,24 +552,25 @@ export class MCPManager {
   }
 
   private static async ensureServerConnected(name: string, forceReconnect = false): Promise<void> {
-    const status = this.serverStatus.get(name);
+    const canonicalName = this.getCanonicalServerName(name);
+    const status = this.serverStatus.get(canonicalName);
     if (status === 'Connected' && !forceReconnect) {
       return;
     }
 
-    const lastAttempt = this.lastConnectTime.get(name) || 0;
+    const lastAttempt = this.lastConnectTime.get(canonicalName) || 0;
     const cooldown = 5000;
     if (status === 'Error' && Date.now() - lastAttempt < cooldown && !forceReconnect) {
-      const errMsg = this.errorMessages.get(name) || 'Server is in error state.';
+      const errMsg = this.errorMessages.get(canonicalName) || 'Server is in error state.';
       throw new Error(`MCP Server "${name}" is offline due to a recent error: ${errMsg}. Please wait a few seconds before retrying.`);
     }
 
     if (forceReconnect) {
-      this.stopServer(name);
+      this.stopServer(canonicalName);
     }
 
     const configs = this.getStoredConfigs();
-    const config = configs.find(c => c.name === name);
+    const config = configs.find(c => c.name === canonicalName);
     if (!config) {
       throw new Error(`MCP Server with name "${name}" is not configured.`);
     }
@@ -559,20 +578,21 @@ export class MCPManager {
   }
 
   public static async callMcpTool(serverName: string, toolName: string, args: any): Promise<string> {
+    const canonicalName = this.getCanonicalServerName(serverName);
     let attempts = 0;
     const maxAttempts = 2;
     while (attempts < maxAttempts) {
       try {
         attempts++;
-        await this.ensureServerConnected(serverName, attempts > 1);
+        await this.ensureServerConnected(canonicalName, attempts > 1);
 
         // Route HTTP-based servers through their stored sender function
-        const httpSender = (this as any)[`http_sender_${serverName}`];
+        const httpSender = (this as any)[`http_sender_${canonicalName}`];
         let result: any;
         if (httpSender) {
           result = await httpSender('tools/call', { name: toolName, arguments: args });
         } else {
-          result = await this.sendRequest(serverName, 'tools/call', {
+          result = await this.sendRequest(canonicalName, 'tools/call', {
             name: toolName,
             arguments: args
           });
@@ -603,12 +623,12 @@ export class MCPManager {
 
         return contentParts.join('\n');
       } catch (err: any) {
-        const prevStatus = this.serverStatus.get(serverName);
+        const prevStatus = this.serverStatus.get(canonicalName);
 
-        this.stopServer(serverName);
-        this.serverStatus.set(serverName, 'Error');
-        this.errorMessages.set(serverName, err.message);
-        delete (this as any)[`http_sender_${serverName}`];
+        this.stopServer(canonicalName);
+        this.serverStatus.set(canonicalName, 'Error');
+        this.errorMessages.set(canonicalName, err.message);
+        delete (this as any)[`http_sender_${canonicalName}`];
 
         const isRetryable = err.message && (
           err.message.includes('timeout') ||
@@ -629,6 +649,8 @@ export class MCPManager {
     }
     return `[MCP TOOL ERROR] Execution failed after ${maxAttempts} attempts.`;
   }
+
+
 
   private static findSystemBrowser(): string | undefined {
     if (process.platform === 'win32') {
@@ -662,5 +684,16 @@ export class MCPManager {
       }
     }
     return undefined;
+  }
+
+  private static commandExists(cmd: string): boolean {
+    const execSync = require('child_process').execSync;
+    try {
+      const checkCmd = process.platform === 'win32' ? `where ${cmd}` : `which ${cmd}`;
+      execSync(checkCmd, { stdio: 'ignore' });
+      return true;
+    } catch {
+      return false;
+    }
   }
 }

@@ -15,9 +15,8 @@ import { ToolManager } from '../tool-manager';
  */
 
 const GUARD_PREFIX = '[DocServer Guard]';
-const MCP_ERROR_PREFIX = '[MCP TOOL ERROR]';
 
-describe('Documentation MCP Guardrail (Context7 & ProContext)', () => {
+describe('Documentation MCP Guardrail (Context7)', () => {
 
   // ─── Allowed: Coding / Dev queries should pass through the guard ───
 
@@ -50,11 +49,6 @@ describe('Documentation MCP Guardrail (Context7 & ProContext)', () => {
         const result = await ToolManager.execute('mcp__Context7__resolve-library-id', args);
         expect(result).not.toContain(GUARD_PREFIX);
       });
-
-      it(`passes through for ProContext: ${desc}`, async () => {
-        const result = await ToolManager.execute('mcp__ProContext__resolve', args);
-        expect(result).not.toContain(GUARD_PREFIX);
-      });
     }
   });
 
@@ -80,23 +74,14 @@ describe('Documentation MCP Guardrail (Context7 & ProContext)', () => {
         expect(result).toContain(GUARD_PREFIX);
         expect(result).toContain('restricted to coding');
       });
-
-      it(`blocks ProContext: ${desc}`, async () => {
-        const result = await ToolManager.execute('mcp__ProContext__resolve', args);
-        expect(result).toContain(GUARD_PREFIX);
-        expect(result).toContain('restricted to coding');
-      });
     }
   });
 
   // ─── Edge cases ───
 
   describe('edge cases', () => {
-    it('allows empty query (server-side will handle) for both', async () => {
-      let result = await ToolManager.execute('mcp__Context7__resolve-library-id', {});
-      expect(result).not.toContain(GUARD_PREFIX);
-
-      result = await ToolManager.execute('mcp__ProContext__resolve', {});
+    it('allows empty query (server-side will handle) for Context7', async () => {
+      const result = await ToolManager.execute('mcp__Context7__resolve-library-id', {});
       expect(result).not.toContain(GUARD_PREFIX);
     });
 
@@ -107,13 +92,6 @@ describe('Documentation MCP Guardrail (Context7 & ProContext)', () => {
 
     it('guard applies to query-docs tool as well', async () => {
       const result = await ToolManager.execute('mcp__Context7__query-docs', {
-        query: 'best vacation spots in hawaii beaches'
-      });
-      expect(result).toContain(GUARD_PREFIX);
-    });
-
-    it('guard applies to ProContext tools as well', async () => {
-      const result = await ToolManager.execute('mcp__ProContext__search', {
         query: 'best vacation spots in hawaii beaches'
       });
       expect(result).toContain(GUARD_PREFIX);
